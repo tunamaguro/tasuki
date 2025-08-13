@@ -18,7 +18,7 @@ WHERE
         (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
       )
       AND 
-      (scheduled_at <= NOW() AND attempts <= max_attempts)
+      (scheduled_at <= NOW() AND attempts <= max_attempts AND queue_name = sqlc.arg(queue_name)::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT sqlc.arg(batch_size)
@@ -66,6 +66,6 @@ WHERE
 -- name: InsertJobOne :exec
 INSERT INTO
   tasuki_job
-  (max_attempts, job_data)
+  (max_attempts, job_data, queue_name)
 VALUES
-  ($1,$2);
+  ($1, $2, $3);
