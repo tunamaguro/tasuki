@@ -44,7 +44,7 @@ pub enum ErrorKind {
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
-    inner: Box<dyn std::error::Error + 'static>,
+    inner: Box<dyn std::error::Error + Send + 'static>,
 }
 
 impl Error {
@@ -57,7 +57,7 @@ impl From<sqlx::Error> for Error {
     fn from(value: sqlx::Error) -> Self {
         Self {
             kind: ErrorKind::DataBase,
-            inner: value.into(),
+            inner: Box::new(value),
         }
     }
 }
@@ -66,7 +66,7 @@ impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self {
             kind: ErrorKind::Encode,
-            inner: value.into(),
+            inner: Box::new(value),
         }
     }
 }
@@ -100,7 +100,7 @@ impl<T> Clone for Client<T> {
 
 impl<T> Client<T>
 where
-    T: Serialize,
+    T: Serialize + Send + 'static,
 {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
@@ -109,24 +109,27 @@ where
         }
     }
 
-    pub async fn insert(&self, data: &InsertJob<T>) -> Result<(), Error> {
-        self.insert_tx(data, &self.pool).await
+    pub fn insert(
+        &self,
+        data: InsertJob<T>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + '_ {
+        Self::insert_tx(data, &self.pool)
     }
 
-    pub async fn insert_tx<'a, A>(&self, data: &InsertJob<T>, tx: A) -> Result<(), Error>
+    pub async fn insert_tx<'a, 'c, A>(
+        data: InsertJob<T>,
+        tx: A,
+    ) -> Result<(), Error>
     where
-        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+        A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
     {
-        let value = serde_json::to_value(&data.data)?;
-
-        let mut conn = tx.acquire().await?;
+        let value = serde_json::to_value(data.data)?;
         queries::InsertJobOne::builder()
             .job_data(&value)
             .max_attempts(data.max_attempts.into())
             .build()
-            .execute(&mut *conn)
+            .execute(tx)
             .await?;
-
         Ok(())
     }
 }

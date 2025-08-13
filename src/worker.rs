@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use crate::queries;
 
 pin_project! {
-    struct Ticker {
+    pub struct Ticker {
         #[pin]
         inner: futures_timer::Delay,
         period: std::time::Duration,
@@ -47,14 +47,14 @@ pub enum ErrorKind {
 struct Error {
     #[allow(unused)]
     kind: ErrorKind,
-    inner: Box<dyn std::error::Error + 'static>,
+    inner: Box<dyn std::error::Error + Send + 'static>,
 }
 
 impl From<sqlx::Error> for Error {
     fn from(value: sqlx::Error) -> Self {
         Self {
             kind: ErrorKind::DataBase,
-            inner: value.into(),
+            inner: Box::new(value),
         }
     }
 }
@@ -63,7 +63,7 @@ impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self {
             kind: ErrorKind::Decode,
-            inner: value.into(),
+            inner: Box::new(value),
         }
     }
 }
@@ -187,26 +187,79 @@ pub enum JobResult {
     Cancel,
 }
 
-pub trait JobHandler<T, S>: Send + Sync + Clone + 'static {
+pub trait JobHandler<T, S, M>: Send + Sync + Clone + 'static {
     type Future: Future<Output = JobResult> + Send;
-    fn call(&self, data: T, context: S) -> Self::Future;
+    fn call(self, data: T, context: S) -> Self::Future;
+}
+
+pub struct JobData<T>(pub T);
+pub struct WorkerContext<S>(pub S);
+
+impl<F, Fut, T, S> JobHandler<T, S, ()> for F
+where
+    F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = JobResult> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, _data: T, _context: S) -> Self::Future {
+        self()
+    }
+}
+
+impl<F, Fut, T, S> JobHandler<T, S, JobData<T>> for F
+where
+    F: FnOnce(JobData<T>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = JobResult> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, data: T, _context: S) -> Self::Future {
+        self(JobData(data))
+    }
+}
+
+impl<F, Fut, T, S> JobHandler<T, S, WorkerContext<S>> for F
+where
+    F: FnOnce(WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = JobResult> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, _data: T, context: S) -> Self::Future {
+        self(WorkerContext(context))
+    }
+}
+
+impl<F, Fut, T, S> JobHandler<T, S, (JobData<T>, WorkerContext<S>)> for F
+where
+    F: FnOnce(JobData<T>, WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = JobResult> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, data: T, context: S) -> Self::Future {
+        self(JobData(data), WorkerContext(context))
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct Worker<Tick, F, T> {
+pub struct Worker<Tick, F, Ctx, T, M> {
     tick: Tick,
     concurrent: usize,
     job_handler: F,
-    data_type: std::marker::PhantomData<T>,
+    context: Ctx,
+    data_type: std::marker::PhantomData<(T, M)>,
 }
 
-impl<Tick, F, T> Worker<Tick, F, T>
+impl<Tick, F, Ctx, T, M> Worker<Tick, F, Ctx, T, M>
 where
     Tick: Stream,
-    F: JobHandler<T, ()>,
+    F: JobHandler<T, Ctx, M>,
+    Ctx: Clone,
     T: DeserializeOwned,
 {
-    fn data_stream(tick: Tick, backend: &BackEnd) -> impl Stream<Item = Result<Job<T>, Error>> {
+    fn data_stream(tick: Tick, backend: BackEnd) -> impl Stream<Item = Result<Job<T>, Error>> {
         let backend = backend.clone();
 
         tick.then(move |_| {
@@ -216,7 +269,7 @@ where
         .flat_map(futures::stream::iter)
     }
 
-    pub async fn run(self, backend: &BackEnd) {
+    pub async fn run(self, backend: BackEnd) {
         let data_stream = Self::data_stream(self.tick, backend);
         let filtered = data_stream.filter_map(|result| async {
             result
@@ -231,7 +284,7 @@ where
                 let hb_every = LEASE_DURATION / 3;
                 let mut ticker = Ticker::new(hb_every).fuse();
 
-                let mut handler_fut = self.job_handler.call(data, ()).boxed().fuse();
+                let mut handler_fut = self.job_handler.clone().call(data, self.context.clone()).boxed().fuse();
                 loop {
                     futures::select! {
                         res = handler_fut => break res,
@@ -257,5 +310,136 @@ where
             .for_each(|_| async {});
 
         fut.await
+    }
+}
+
+pub struct WorkerBuilder<Tick = Ticker, Ctx = ()> {
+    tick: Tick,
+    context: Ctx,
+    concurrent: usize,
+}
+
+impl Default for WorkerBuilder<Ticker, ()> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerBuilder<Ticker, ()> {
+    pub fn new() -> Self {
+        let ticker = Ticker::new(std::time::Duration::from_secs(1));
+        WorkerBuilder {
+            tick: ticker,
+            context: (),
+            concurrent: 8,
+        }
+    }
+}
+
+impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
+    pub fn tick<Tick2>(self, tick: Tick2) -> WorkerBuilder<Tick2, Ctx>
+    where
+        Tick2: Stream,
+    {
+        WorkerBuilder {
+            tick,
+            context: self.context,
+            concurrent: self.concurrent,
+        }
+    }
+
+    pub fn context<Ctx2>(self, context: Ctx2) -> WorkerBuilder<Tick, Ctx2>
+    where
+        Ctx2: Clone,
+    {
+        WorkerBuilder {
+            context,
+            tick: self.tick,
+            concurrent: self.concurrent,
+        }
+    }
+
+    pub fn concurrent(self, concurrent: usize) -> Self {
+        Self { concurrent, ..self }
+    }
+}
+
+impl<Ctx> WorkerBuilder<Ticker, Ctx> {
+    pub fn polling_interval(self, period: std::time::Duration) -> Self {
+        let ticker = Ticker::new(period);
+        WorkerBuilder {
+            tick: ticker,
+            ..self
+        }
+    }
+}
+
+impl<Tick, Ctx> WorkerBuilder<Tick, Ctx>
+where
+    Tick: Stream,
+    Ctx: Clone,
+{
+    pub fn build_noarg<F>(self, f: F) -> Worker<Tick, F, Ctx, (), ()>
+    where
+        F: JobHandler<(), Ctx, ()>,
+    {
+        Worker {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: f,
+            context: self.context,
+            data_type: std::marker::PhantomData,
+        }
+    }
+
+    pub fn build_with_data<F, Fut, T>(self, f: F) -> Worker<Tick, F, Ctx, T, JobData<T>>
+    where
+        F: FnOnce(JobData<T>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+        F: JobHandler<T, Ctx, JobData<T>>,
+        T: DeserializeOwned + 'static,
+    {
+        Worker {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: f,
+            context: self.context,
+            data_type: std::marker::PhantomData,
+        }
+    }
+
+    pub fn build_with_ctx<F, Fut, T>(self, f: F) -> Worker<Tick, F, Ctx, T, WorkerContext<Ctx>>
+    where
+        F: FnOnce(WorkerContext<Ctx>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+        F: JobHandler<T, Ctx, WorkerContext<Ctx>>,
+        T: DeserializeOwned + 'static,
+    {
+        Worker {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: f,
+            context: self.context,
+            data_type: std::marker::PhantomData,
+        }
+    }
+
+    pub fn build_with_both<F, Fut, T>(
+        self,
+        f: F,
+    ) -> Worker<Tick, F, Ctx, T, (JobData<T>, WorkerContext<Ctx>)>
+    where
+        F: FnOnce(JobData<T>, WorkerContext<Ctx>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+        F: JobHandler<T, Ctx, (JobData<T>, WorkerContext<Ctx>)>,
+        T: DeserializeOwned + 'static,
+    {
+        Worker {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: f,
+            context: self.context,
+            data_type: std::marker::PhantomData,
+        }
     }
 }

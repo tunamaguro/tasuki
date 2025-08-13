@@ -5,4 +5,4 @@ mod client;
 pub use client::{Client, Error as ClientError, InsertJob};
 
 mod worker;
-pub use worker::{BackEnd, JobHandler, JobResult, Worker};
+pub use worker::{BackEnd, JobData, JobHandler, JobResult, Worker, WorkerBuilder, WorkerContext};
