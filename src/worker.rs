@@ -341,6 +341,19 @@ where
     F::Data: DeserializeOwned + 'static,
     Ctx: Clone,
 {
+    pub fn with_graceful_shutdown<Signal>(self, signal: Signal) -> Worker<impl Stream, F, Ctx, M>
+    where
+        Signal: Future,
+    {
+        Worker {
+            tick: self.tick.take_until(signal),
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            _marker: self._marker,
+        }
+    }
+
     /// Start polling the backend and executing jobs until the stream
     /// terminates.
     pub async fn run(self, backend: BackEnd) {
