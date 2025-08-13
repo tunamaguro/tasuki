@@ -472,7 +472,7 @@ where
     }
 
     /// Build a [`Worker`] for handlers that use the shared context.
-    pub fn build_with_ctx<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, Ctx>
+    pub fn build_with_ctx<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, WorkerContext<Ctx>>
     where
         F: JobHandler<T, Ctx, WorkerContext<Ctx>>,
         T: DeserializeOwned + 'static,
@@ -487,7 +487,10 @@ where
     }
 
     /// Build a [`Worker`] for handlers that require both job data and context.
-    pub fn build_with_both<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, (JobData<T>, Ctx)>
+    pub fn build_with_both<F, T>(
+        self,
+        f: F,
+    ) -> Worker<Tick, F, Ctx, T, (JobData<T>, WorkerContext<Ctx>)>
     where
         F: JobHandler<T, Ctx, (JobData<T>, WorkerContext<Ctx>)>,
         T: DeserializeOwned + 'static,
