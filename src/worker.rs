@@ -1,3 +1,10 @@
+//! Utilities for polling and processing queued jobs.
+//!
+//! The worker module provides types for fetching jobs from the database
+//! and executing them with user supplied handlers.  A [`Worker`] polls a
+//! [`BackEnd`] at a fixed interval and drives job handlers to completion
+//! while periodically sending heartbeats to maintain job leases.
+
 use futures::{FutureExt, Stream, StreamExt};
 use pin_project_lite::pin_project;
 use serde::de::DeserializeOwned;
@@ -5,6 +12,8 @@ use serde::de::DeserializeOwned;
 use crate::queries;
 
 pin_project! {
+    /// Stream that yields at a fixed period and is used to drive polling or
+    /// heartbeat logic within a [`Worker`].
     pub struct Ticker {
         #[pin]
         inner: futures_timer::Delay,
@@ -38,8 +47,11 @@ impl Stream for Ticker {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Categorization of failures that may occur while processing jobs.
 pub enum ErrorKind {
+    /// Errors originating from database interactions.
     DataBase,
+    /// Errors that happen while decoding job payloads.
     Decode,
 }
 
@@ -143,12 +155,17 @@ struct Job<T> {
 }
 
 #[derive(Debug, Clone)]
+/// Backend for fetching and updating jobs in the database.
+///
+/// A `BackEnd` wraps a [`sqlx::PgPool`] and the name of the queue to pull
+/// jobs from. It is consumed by [`Worker`] to obtain work items.
 pub struct BackEnd {
     pool: sqlx::PgPool,
     queue_name: std::borrow::Cow<'static, str>,
 }
 
 impl BackEnd {
+    /// Create a new backend using the given connection pool.
     pub fn new(pool: sqlx::PgPool) -> BackEnd {
         BackEnd {
             pool,
@@ -156,6 +173,7 @@ impl BackEnd {
         }
     }
 
+    /// Override the queue name from which jobs are fetched.
     pub fn queue_name<S>(self, queue_name: S) -> Self
     where
         S: Into<std::borrow::Cow<'static, str>>,
@@ -196,18 +214,32 @@ impl BackEnd {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Outcome produced by a job handler.
 pub enum JobResult {
+    /// Mark the job as successfully completed.
     Complete,
+    /// Requeue the job after an optional delay.
     Retry(Option<std::time::Duration>),
+    /// Cancel the job without retrying.
     Cancel,
 }
 
+/// Trait implemented by functions that process a job.
+///
+/// The `M` type parameter determines which combination of [`JobData`] and
+/// [`WorkerContext`] the handler expects.
 pub trait JobHandler<T, S, M>: Send + Sync + Clone + 'static {
+    /// Future returned by the handler.
     type Future: Future<Output = JobResult> + Send;
+
+    /// Invoke the handler with the job data and worker context.
     fn call(self, data: T, context: S) -> Self::Future;
 }
 
+/// Wrapper passed to handlers that request the job payload.
 pub struct JobData<T>(pub T);
+
+/// Wrapper passed to handlers that require access to shared context.
 pub struct WorkerContext<S>(pub S);
 
 impl<F, Fut, T, S> JobHandler<T, S, ()> for F
@@ -259,6 +291,11 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// Polls for jobs and executes them using the provided handler.
+///
+/// The generic parameters allow customizing the ticker stream (`Tick`),
+/// job handler (`F`), shared context (`Ctx`), job payload (`T`) and marker
+/// type (`M`) that specifies which arguments are supplied to the handler.
 pub struct Worker<Tick, F, Ctx, T, M> {
     tick: Tick,
     concurrent: usize,
@@ -284,6 +321,8 @@ where
         .flat_map(futures::stream::iter)
     }
 
+    /// Start polling the backend and executing jobs until the stream
+    /// terminates.
     pub async fn run(self, backend: BackEnd) {
         let data_stream = Self::data_stream(self.tick, backend);
         let filtered = data_stream.filter_map(|result| async {
@@ -328,6 +367,10 @@ where
     }
 }
 
+/// Builder for configuring and constructing [`Worker`] instances.
+///
+/// By default it polls every second with no shared context and a
+/// concurrency limit of eight.
 pub struct WorkerBuilder<Tick = Ticker, Ctx = ()> {
     tick: Tick,
     context: Ctx,
@@ -341,6 +384,7 @@ impl Default for WorkerBuilder<Ticker, ()> {
 }
 
 impl WorkerBuilder<Ticker, ()> {
+    /// Create a new builder with default configuration.
     pub fn new() -> Self {
         let ticker = Ticker::new(std::time::Duration::from_secs(1));
         WorkerBuilder {
@@ -352,6 +396,7 @@ impl WorkerBuilder<Ticker, ()> {
 }
 
 impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
+    /// Replace the ticker driving the polling loop.
     pub fn tick<Tick2>(self, tick: Tick2) -> WorkerBuilder<Tick2, Ctx>
     where
         Tick2: Stream,
@@ -363,6 +408,7 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
         }
     }
 
+    /// Provide shared context that will be passed to every job handler.
     pub fn context<Ctx2>(self, context: Ctx2) -> WorkerBuilder<Tick, Ctx2>
     where
         Ctx2: Clone,
@@ -374,12 +420,14 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
         }
     }
 
+    /// Set the maximum number of jobs processed concurrently.
     pub fn concurrent(self, concurrent: usize) -> Self {
         Self { concurrent, ..self }
     }
 }
 
 impl<Ctx> WorkerBuilder<Ticker, Ctx> {
+    /// Adjust how frequently the worker polls for new jobs.
     pub fn polling_interval(self, period: std::time::Duration) -> Self {
         let ticker = Ticker::new(period);
         WorkerBuilder {
@@ -394,6 +442,7 @@ where
     Tick: Stream,
     Ctx: Clone,
 {
+    /// Build a [`Worker`] for handlers that take no arguments.
     pub fn build_noarg<F>(self, f: F) -> Worker<Tick, F, Ctx, (), ()>
     where
         F: JobHandler<(), Ctx, ()>,
@@ -407,6 +456,7 @@ where
         }
     }
 
+    /// Build a [`Worker`] for handlers that consume job data.
     pub fn build_with_data<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, JobData<T>>
     where
         F: JobHandler<T, Ctx, JobData<T>>,
@@ -421,6 +471,7 @@ where
         }
     }
 
+    /// Build a [`Worker`] for handlers that use the shared context.
     pub fn build_with_ctx<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, Ctx>
     where
         F: JobHandler<T, Ctx, WorkerContext<Ctx>>,
@@ -435,6 +486,7 @@ where
         }
     }
 
+    /// Build a [`Worker`] for handlers that require both job data and context.
     pub fn build_with_both<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, (JobData<T>, Ctx)>
     where
         F: JobHandler<T, Ctx, (JobData<T>, WorkerContext<Ctx>)>,
