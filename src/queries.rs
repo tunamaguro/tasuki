@@ -128,18 +128,16 @@ RETURNING j.id, j.job_data";
             .bind(self.queue_name)
             .bind(self.batch_size)
     }
-    pub fn query_many<'b, A>(
+    pub async fn query_many<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<Vec<GetAvailableJobsRow>, sqlx::Error>> + Send + 'a
+    ) -> Result<Vec<GetAvailableJobsRow>, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
+        let mut conn = conn.acquire().await?;
+        let vals = self.query_as().fetch_all(&mut *conn).await?;
+        Ok(vals)
     }
 }
 impl<'a> GetAvailableJobs<'a> {
@@ -229,23 +227,19 @@ WHERE
             .bind(self.id)
             .bind(self.lease_interval)
     }
-    pub fn execute<'b, A>(
+    pub async fn execute<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .bind(self.lease_interval)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .bind(self.lease_interval)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl<'a> HeartBeatJob<'a> {
@@ -314,22 +308,18 @@ WHERE
     > {
         sqlx::query_as::<_, CompleteJobRow>(Self::QUERY).bind(self.id)
     }
-    pub fn execute<'a, 'b, A>(
+    pub async fn execute<'a, 'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl CompleteJob {
@@ -382,22 +372,18 @@ WHERE
     > {
         sqlx::query_as::<_, CancelJobRow>(Self::QUERY).bind(self.id)
     }
-    pub fn execute<'a, 'b, A>(
+    pub async fn execute<'a, 'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl CancelJob {
@@ -459,23 +445,19 @@ WHERE
             .bind(self.id)
             .bind(self.interval)
     }
-    pub fn execute<'b, A>(
+    pub async fn execute<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .bind(self.interval)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .bind(self.interval)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl<'a> RetryJob<'a> {
@@ -545,24 +527,20 @@ VALUES
             .bind(self.job_data)
             .bind(self.queue_name)
     }
-    pub fn execute<'b, A>(
+    pub async fn execute<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.max_attempts)
-                .bind(self.job_data)
-                .bind(self.queue_name)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.max_attempts)
+            .bind(self.job_data)
+            .bind(self.queue_name)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl<'a> InsertJobOne<'a> {
