@@ -1,15 +1,24 @@
+//! Client utilities for enqueuing jobs into the Tasuki queue.
+
 use serde::Serialize;
 
 use crate::queries;
 
+/// Configuration for inserting a job into the queue.
+///
+/// The generic `T` represents the job payload that will be serialized and
+/// stored in the database.  A job can be customised with the number of times it
+/// may be retried before being considered failed.
 pub struct InsertJob<T> {
     data: T,
     max_attempts: u16,
 }
 
 impl<T> InsertJob<T> {
+    /// Default maximum number of attempts a job may be retried.
     const DEFAULT_MAX_ATTEMPTS: u16 = 25;
 
+    /// Create a new `InsertJob` wrapping the provided payload.
     pub const fn new(data: T) -> Self {
         Self {
             data,
@@ -17,6 +26,7 @@ impl<T> InsertJob<T> {
         }
     }
 
+    /// Set how many times the job may be retried.
     pub fn max_attempts(self, max_attempts: u16) -> Self {
         Self {
             max_attempts,
@@ -24,6 +34,7 @@ impl<T> InsertJob<T> {
         }
     }
 
+    /// Extract the wrapped job payload.
     pub fn into_inner(self) -> T {
         self.data
     }
@@ -36,18 +47,23 @@ impl<T> From<T> for InsertJob<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Categories of errors that can occur when inserting a job.
 pub enum ErrorKind {
+    /// An error was returned by the database layer.
     DataBase,
+    /// Serialization of the job data failed.
     Encode,
 }
 
 #[derive(Debug)]
+/// Error type returned by [`Client`] operations.
 pub struct Error {
     kind: ErrorKind,
     inner: Box<dyn std::error::Error + Send + 'static>,
 }
 
 impl Error {
+    /// Return the category of this error.
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
@@ -84,6 +100,7 @@ impl std::error::Error for Error {
 }
 
 #[derive(Debug)]
+/// A handle used to enqueue jobs into a PostgreSQL-backed queue.
 pub struct Client<T> {
     pool: sqlx::PgPool,
     queue_name: std::borrow::Cow<'static, str>,
@@ -101,6 +118,7 @@ impl<T> Clone for Client<T> {
 }
 
 impl<T> Client<T> {
+    /// Create a new client bound to the given connection pool.
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
@@ -109,6 +127,7 @@ impl<T> Client<T> {
         }
     }
 
+    /// Specify the queue name used when inserting jobs.
     pub fn queue_name<S>(self, queue_name: S) -> Self
     where
         S: Into<std::borrow::Cow<'static, str>>,
@@ -124,6 +143,7 @@ impl<T> Client<T>
 where
     T: Serialize + Send + Sync + 'static,
 {
+    /// Insert a job into the queue using the client's connection pool.
     pub fn insert(
         &self,
         data: InsertJob<T>,
@@ -131,6 +151,7 @@ where
         self.insert_tx(data, &self.pool)
     }
 
+    /// Insert a job using an existing transaction or connection.
     pub async fn insert_tx<'a, 'c, A>(&self, data: InsertJob<T>, tx: A) -> Result<(), Error>
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
