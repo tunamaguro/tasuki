@@ -341,44 +341,101 @@ where
     F::Data: DeserializeOwned + 'static,
     Ctx: Clone,
 {
-    pub fn with_graceful_shutdown<Signal>(self, signal: Signal) -> Worker<impl Stream, F, Ctx, M>
+    pub fn with_graceful_shutdown<Signal>(
+        self,
+        signal: Signal,
+    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
     where
         Signal: Future,
     {
-        Worker {
-            tick: self.tick.take_until(signal),
+        WorkerWithGracefulShutdown {
+            tick: self.tick,
             concurrent: self.concurrent,
             job_handler: self.job_handler,
             context: self.context,
             _marker: self._marker,
+            signal: signal,
         }
     }
 
     /// Start polling the backend and executing jobs until the stream
     /// terminates.
     pub async fn run(self, backend: BackEnd) {
-        let data_stream = backend.into_datastream(self.tick, 8);
+        run_worker(
+            self.tick,
+            self.job_handler,
+            self.context,
+            backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
 
-        let filtered = data_stream.filter_map(|result| async {
-            result
-                .inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
-                .ok()
-        });
+pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
+    tick: Tick,
+    concurrent: usize,
+    job_handler: F,
+    context: Ctx,
+    _marker: std::marker::PhantomData<M>,
+    signal: Signal,
+}
 
-        let runner = filtered.map(|job| async {
-            let Job { context, data } = job;
+impl<Tick, F, Ctx, M, Signal> WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal>
+where
+    Tick: Stream,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned + 'static,
+    Ctx: Clone,
+    Signal: Future,
+{
+    pub async fn run(self, backend: BackEnd) {
+        let tick = self.tick.take_until(self.signal);
+        run_worker(
+            tick,
+            self.job_handler,
+            self.context,
+            backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
+
+async fn run_worker<Tick, F, M, Ctx>(
+    tick: Tick,
+    handler: F,
+    worker_context: Ctx,
+    backend: BackEnd,
+    concurrent: usize,
+) where
+    Tick: Stream,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned,
+    Ctx: Clone,
+{
+    let data_stream = backend.into_datastream(tick, 8);
+
+    let filtered = data_stream.filter_map(|result| async {
+        result
+            .inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
+            .ok()
+    });
+
+    let runner = filtered.map(|job| async {
+            let Job { context:job_context, data } = job;
             tracing::trace!("Start handler");
             let result = {
                 let hb_every = LEASE_DURATION / 3;
                 let mut ticker = Ticker::new(hb_every).fuse();
 
-                let mut handler_fut = self.job_handler.clone().call(data, self.context.clone()).boxed().fuse();
+                let mut handler_fut = handler.clone().call(data, worker_context.clone()).boxed().fuse();
                 loop {
                     futures::select! {
                         res = handler_fut => break res,
                         _ = ticker.next() =>{
-                            let _res = context.heartbeat().await.inspect_err(
-                                |error| tracing::error!(error = %error, job_id = %context.id, "Failed to heartbeat job"),
+                            let _res = job_context.heartbeat().await.inspect_err(
+                                |error| tracing::error!(error = %error, job_id = %job_context.id, "Failed to heartbeat job"),
                             );
                         }
                     }
@@ -387,18 +444,15 @@ where
             tracing::trace!("Finish handler");
 
             let _ =match result {
-                JobResult::Complete => {context.complete().await.inspect_err(   |error| tracing::error!(error = %error, "Failed to complete job"))},
-                JobResult::Retry(duration) =>  {context.retry(duration).await.inspect_err(|error| tracing::error!(error = %error, "Failed to retry job"))},
-                JobResult::Cancel => {context.cancel().await.inspect_err(|error|tracing::error!(error = %error, "Failed to cancel job"))},
+                JobResult::Complete => {job_context.complete().await.inspect_err(   |error| tracing::error!(error = %error, "Failed to complete job"))},
+                JobResult::Retry(duration) =>  {job_context.retry(duration).await.inspect_err(|error| tracing::error!(error = %error, "Failed to retry job"))},
+                JobResult::Cancel => {job_context.cancel().await.inspect_err(|error|tracing::error!(error = %error, "Failed to cancel job"))},
             };
         });
 
-        let fut = runner
-            .buffer_unordered(self.concurrent)
-            .for_each(|_| async {});
+    let fut = runner.buffer_unordered(concurrent).for_each(|_| async {});
 
-        fut.await
-    }
+    fut.await
 }
 
 /// Builder for configuring and constructing [`Worker`] instances.
