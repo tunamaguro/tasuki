@@ -116,10 +116,7 @@ where
         Self::insert_tx(data, &self.pool)
     }
 
-    pub async fn insert_tx<'a, 'c, A>(
-        data: InsertJob<T>,
-        tx: A,
-    ) -> Result<(), Error>
+    pub async fn insert_tx<'a, 'c, A>(data: InsertJob<T>, tx: A) -> Result<(), Error>
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
     {
