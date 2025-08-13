@@ -354,7 +354,7 @@ where
             job_handler: self.job_handler,
             context: self.context,
             _marker: self._marker,
-            signal: signal,
+            signal,
         }
     }
 
