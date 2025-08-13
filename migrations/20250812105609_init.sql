@@ -1,5 +1,5 @@
 -- Add migration script here
-CREATE TYPE tasuki_job_status AS ENUM ('pending', 'running', 'completed', 'failed');
+CREATE TYPE tasuki_job_status AS ENUM ('pending', 'running', 'completed', 'failed', 'canceled');
 
 CREATE TABLE IF NOT EXISTS  tasuki_job (
     id  UUID NOT NULL DEFAULT gen_random_uuid(),

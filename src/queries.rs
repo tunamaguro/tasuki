@@ -30,9 +30,7 @@ impl<C: std::ops::DerefMut<Target = sqlx::PgConnection>> CopyDataSink<C> {
         Ok(())
     }
     /// Complete copy process and return number of rows affected.
-    pub async fn finish(
-        mut self,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn finish(mut self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         const COPY_TRAILER: &[u8] = &(-1_i16).to_be_bytes();
         self.data_buf.extend(COPY_TRAILER);
         self.send().await?;
@@ -55,7 +53,8 @@ impl<C: std::ops::DerefMut<Target = sqlx::PgConnection>> CopyDataSink<C> {
                 self.data_buf.extend((-1_i32).to_be_bytes());
             }
             sqlx::encode::IsNull::No => {
-                self.data_buf.extend((self.encode_buf.len() as i32).to_be_bytes());
+                self.data_buf
+                    .extend((self.encode_buf.len() as i32).to_be_bytes());
                 self.data_buf.extend_from_slice(self.encode_buf.as_slice());
             }
         }
@@ -77,6 +76,8 @@ pub enum TasukiJobStatus {
     Completed,
     #[sqlx(rename = "failed")]
     Failed,
+    #[sqlx(rename = "canceled")]
+    Canceled,
 }
 #[derive(sqlx::FromRow)]
 pub struct GetAvailableJobsRow {
@@ -93,7 +94,7 @@ impl<'a> GetAvailableJobs<'a> {
 SET
   status = 'running',
   attempts = j.attempts + 1,
-  lease_expires_at = clock_timestamp() + make_interval(secs := $1::INTERVAL)
+  lease_expires_at = clock_timestamp() + $1::INTERVAL
 WHERE 
   id in (
     SELECT 
@@ -101,9 +102,13 @@ WHERE
     FROM
       tasuki_job
     WHERE 
-      (status = 'pending' AND scheduled_at <= NOW())
-      OR
-      (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
+      (
+        (status = 'pending')
+        OR
+        (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
+      )
+      AND 
+      (scheduled_at <= NOW() AND attempts <= max_attempts)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
@@ -121,18 +126,16 @@ RETURNING j.id, j.job_data";
             .bind(self.lease_interval)
             .bind(self.batch_size)
     }
-    pub fn query_many<'b, A>(
+    pub async fn query_many<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<Vec<GetAvailableJobsRow>, sqlx::Error>> + Send + 'a
+    ) -> Result<Vec<GetAvailableJobsRow>, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
+        let mut conn = conn.acquire().await?;
+        let vals = self.query_as().fetch_all(&mut *conn).await?;
+        Ok(vals)
     }
 }
 impl<'a> GetAvailableJobs<'a> {
@@ -151,10 +154,7 @@ impl<'a, BatchSize> GetAvailableJobsBuilder<'a, ((), BatchSize)> {
     pub fn lease_interval(
         self,
         lease_interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> GetAvailableJobsBuilder<
-        'a,
-        (&'a sqlx::postgres::types::PgInterval, BatchSize),
-    > {
+    ) -> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, BatchSize)> {
         let ((), batch_size) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
@@ -164,10 +164,7 @@ impl<'a, BatchSize> GetAvailableJobsBuilder<'a, ((), BatchSize)> {
     }
 }
 impl<'a, LeaseInterval> GetAvailableJobsBuilder<'a, (LeaseInterval, ())> {
-    pub fn batch_size(
-        self,
-        batch_size: i32,
-    ) -> GetAvailableJobsBuilder<'a, (LeaseInterval, i32)> {
+    pub fn batch_size(self, batch_size: i32) -> GetAvailableJobsBuilder<'a, (LeaseInterval, i32)> {
         let (lease_interval, ()) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
@@ -183,6 +180,305 @@ impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, i32
             lease_interval,
             batch_size,
         }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct HeartBeatJobRow {}
+pub struct HeartBeatJob<'a> {
+    id: sqlx::types::Uuid,
+    lease_interval: &'a sqlx::postgres::types::PgInterval,
+}
+impl<'a> HeartBeatJob<'a> {
+    pub const QUERY: &'static str = r"UPDATE 
+  tasuki_job j
+SET
+  lease_expires_at = clock_timestamp() + $2::INTERVAL
+WHERE
+  id = $1";
+    pub fn query_as(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        HeartBeatJobRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, HeartBeatJobRow>(Self::QUERY)
+            .bind(self.id)
+            .bind(self.lease_interval)
+    }
+    pub async fn execute<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .bind(self.lease_interval)
+            .execute(&mut *conn)
+            .await
+    }
+}
+impl<'a> HeartBeatJob<'a> {
+    pub const fn builder() -> HeartBeatJobBuilder<'a, ((), ())> {
+        HeartBeatJobBuilder {
+            fields: ((), ()),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct HeartBeatJobBuilder<'a, Fields = ((), ())> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a, LeaseInterval> HeartBeatJobBuilder<'a, ((), LeaseInterval)> {
+    pub fn id(
+        self,
+        id: sqlx::types::Uuid,
+    ) -> HeartBeatJobBuilder<'a, (sqlx::types::Uuid, LeaseInterval)> {
+        let ((), lease_interval) = self.fields;
+        let _phantom = self._phantom;
+        HeartBeatJobBuilder {
+            fields: (id, lease_interval),
+            _phantom,
+        }
+    }
+}
+impl<'a, Id> HeartBeatJobBuilder<'a, (Id, ())> {
+    pub fn lease_interval(
+        self,
+        lease_interval: &'a sqlx::postgres::types::PgInterval,
+    ) -> HeartBeatJobBuilder<'a, (Id, &'a sqlx::postgres::types::PgInterval)> {
+        let (id, ()) = self.fields;
+        let _phantom = self._phantom;
+        HeartBeatJobBuilder {
+            fields: (id, lease_interval),
+            _phantom,
+        }
+    }
+}
+impl<'a> HeartBeatJobBuilder<'a, (sqlx::types::Uuid, &'a sqlx::postgres::types::PgInterval)> {
+    pub const fn build(self) -> HeartBeatJob<'a> {
+        let (id, lease_interval) = self.fields;
+        HeartBeatJob { id, lease_interval }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct CompleteJobRow {}
+pub struct CompleteJob {
+    id: sqlx::types::Uuid,
+}
+impl CompleteJob {
+    pub const QUERY: &'static str = r"UPDATE 
+  tasuki_job j
+SET 
+  status = 'completed'
+WHERE
+  id = $1";
+    pub fn query_as<'a>(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        CompleteJobRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, CompleteJobRow>(Self::QUERY).bind(self.id)
+    }
+    pub async fn execute<'a, 'b, A>(
+        &'a self,
+        conn: A,
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .execute(&mut *conn)
+            .await
+    }
+}
+impl CompleteJob {
+    pub const fn builder() -> CompleteJobBuilder<'static, ((),)> {
+        CompleteJobBuilder {
+            fields: ((),),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct CompleteJobBuilder<'a, Fields = ((),)> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> CompleteJobBuilder<'a, ((),)> {
+    pub fn id(self, id: sqlx::types::Uuid) -> CompleteJobBuilder<'a, (sqlx::types::Uuid,)> {
+        let ((),) = self.fields;
+        let _phantom = self._phantom;
+        CompleteJobBuilder {
+            fields: (id,),
+            _phantom,
+        }
+    }
+}
+impl<'a> CompleteJobBuilder<'a, (sqlx::types::Uuid,)> {
+    pub const fn build(self) -> CompleteJob {
+        let (id,) = self.fields;
+        CompleteJob { id }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct CancelJobRow {}
+pub struct CancelJob {
+    id: sqlx::types::Uuid,
+}
+impl CancelJob {
+    pub const QUERY: &'static str = r"UPDATE
+  tasuki_job j
+SET
+  status = 'canceled'
+WHERE
+  id = $1";
+    pub fn query_as<'a>(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        CancelJobRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, CancelJobRow>(Self::QUERY).bind(self.id)
+    }
+    pub async fn execute<'a, 'b, A>(
+        &'a self,
+        conn: A,
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .execute(&mut *conn)
+            .await
+    }
+}
+impl CancelJob {
+    pub const fn builder() -> CancelJobBuilder<'static, ((),)> {
+        CancelJobBuilder {
+            fields: ((),),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct CancelJobBuilder<'a, Fields = ((),)> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> CancelJobBuilder<'a, ((),)> {
+    pub fn id(self, id: sqlx::types::Uuid) -> CancelJobBuilder<'a, (sqlx::types::Uuid,)> {
+        let ((),) = self.fields;
+        let _phantom = self._phantom;
+        CancelJobBuilder {
+            fields: (id,),
+            _phantom,
+        }
+    }
+}
+impl<'a> CancelJobBuilder<'a, (sqlx::types::Uuid,)> {
+    pub const fn build(self) -> CancelJob {
+        let (id,) = self.fields;
+        CancelJob { id }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct RetryJobRow {}
+pub struct RetryJob<'a> {
+    id: sqlx::types::Uuid,
+    interval: &'a sqlx::postgres::types::PgInterval,
+}
+impl<'a> RetryJob<'a> {
+    pub const QUERY: &'static str = r"UPDATE tasuki_job j
+SET 
+  status = CASE 
+            WHEN j.attempts <= j.max_attempts THEN 'pending'
+            ELSE 'failed'
+           END,
+  scheduled_at = CASE
+                  WHEN j.attempts <= j.max_attempts THEN clock_timestamp() + $2::INTERVAL
+                  ELSE scheduled_at
+                 END 
+WHERE 
+  id = $1";
+    pub fn query_as(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        RetryJobRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, RetryJobRow>(Self::QUERY)
+            .bind(self.id)
+            .bind(self.interval)
+    }
+    pub async fn execute<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.id)
+            .bind(self.interval)
+            .execute(&mut *conn)
+            .await
+    }
+}
+impl<'a> RetryJob<'a> {
+    pub const fn builder() -> RetryJobBuilder<'a, ((), ())> {
+        RetryJobBuilder {
+            fields: ((), ()),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct RetryJobBuilder<'a, Fields = ((), ())> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a, Interval> RetryJobBuilder<'a, ((), Interval)> {
+    pub fn id(self, id: sqlx::types::Uuid) -> RetryJobBuilder<'a, (sqlx::types::Uuid, Interval)> {
+        let ((), interval) = self.fields;
+        let _phantom = self._phantom;
+        RetryJobBuilder {
+            fields: (id, interval),
+            _phantom,
+        }
+    }
+}
+impl<'a, Id> RetryJobBuilder<'a, (Id, ())> {
+    pub fn interval(
+        self,
+        interval: &'a sqlx::postgres::types::PgInterval,
+    ) -> RetryJobBuilder<'a, (Id, &'a sqlx::postgres::types::PgInterval)> {
+        let (id, ()) = self.fields;
+        let _phantom = self._phantom;
+        RetryJobBuilder {
+            fields: (id, interval),
+            _phantom,
+        }
+    }
+}
+impl<'a> RetryJobBuilder<'a, (sqlx::types::Uuid, &'a sqlx::postgres::types::PgInterval)> {
+    pub const fn build(self) -> RetryJob<'a> {
+        let (id, interval) = self.fields;
+        RetryJob { id, interval }
     }
 }
 #[derive(sqlx::FromRow)]
@@ -209,23 +505,19 @@ VALUES
             .bind(self.max_attempts)
             .bind(self.job_data)
     }
-    pub fn execute<'b, A>(
+    pub async fn execute<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<
-        Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>,
-    > + Send + 'a
+    ) -> Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.max_attempts)
-                .bind(self.job_data)
-                .execute(&mut *conn)
-                .await
-        }
+        let mut conn = conn.acquire().await?;
+        sqlx::query(Self::QUERY)
+            .bind(self.max_attempts)
+            .bind(self.job_data)
+            .execute(&mut *conn)
+            .await
     }
 }
 impl<'a> InsertJobOne<'a> {
@@ -241,10 +533,7 @@ pub struct InsertJobOneBuilder<'a, Fields = ((), ())> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a, JobData> InsertJobOneBuilder<'a, ((), JobData)> {
-    pub fn max_attempts(
-        self,
-        max_attempts: i32,
-    ) -> InsertJobOneBuilder<'a, (i32, JobData)> {
+    pub fn max_attempts(self, max_attempts: i32) -> InsertJobOneBuilder<'a, (i32, JobData)> {
         let ((), job_data) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
