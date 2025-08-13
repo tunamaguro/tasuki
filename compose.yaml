@@ -6,7 +6,7 @@ services:
     volumes:
       - .:/workspace:cached
   postgres:
-    image: postgres:17.5-alpine
+    image: postgres:17.5-bookworm
     environment:
       POSTGRES_USER: root
       POSTGRES_PASSWORD: password

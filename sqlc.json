@@ -1,0 +1,36 @@
+{
+    "version": "2",
+    "plugins": [
+        {
+            "name": "sqlc-gen-rust",
+            "wasm": {
+                "url": "https://github.com/tunamaguro/sqlc-gen-rust/releases/download/v0.1.6/sqlc-gen-rust.wasm",
+                "sha256": "d675f987b5d70937d27664c587bb8c7991e806353ce70529d09534a13e079c97"
+            }
+        }
+    ],
+    "sql": [
+        {
+            "schema": "./migrations/*.sql",
+            "queries": "./queries/",
+            "engine": "postgresql",
+            "codegen": [
+                {
+                    "plugin": "sqlc-gen-rust",
+                    "out": "src/",
+                    "options": {
+                        "output": "queries.rs",
+                        "db_crate": "sqlx-postgres",
+                        "overrides": [
+                            {
+                                "db_type": "uuid",
+                                "rs_type": "sqlx::types::Uuid",
+                                "copy_cheap": true
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
+}
