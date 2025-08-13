@@ -1,4 +1,4 @@
-use tasuki::{BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder};
+use tasuki::{BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext};
 
 #[tokio::main]
 async fn main() {
@@ -12,7 +12,7 @@ async fn main() {
         .unwrap();
 
     let backend = BackEnd::new(pool.clone());
-    let worker = WorkerBuilder::new().build_with_data(job_handler);
+    let worker = WorkerBuilder::new().build(job_handler);
 
     let client = Client::<u64>::new(pool.clone());
     let client_handle = async move {
@@ -41,7 +41,10 @@ async fn main() {
     tasks.join_all().await;
 }
 
-async fn job_handler(JobData(count): JobData<u64>) -> JobResult {
+async fn job_handler(
+    JobData(count): JobData<u64>,
+    WorkerContext(_): WorkerContext<()>,
+) -> JobResult {
     let handle = tokio::spawn(async move {
         tracing::info!("-start: job {}", count);
         tokio::time::sleep(std::time::Duration::from_secs(count % 5 + 1)).await;
