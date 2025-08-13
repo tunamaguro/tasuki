@@ -145,11 +145,25 @@ struct Job<T> {
 #[derive(Debug, Clone)]
 pub struct BackEnd {
     pool: sqlx::PgPool,
+    queue_name: std::borrow::Cow<'static, str>,
 }
 
 impl BackEnd {
     pub fn new(pool: sqlx::PgPool) -> BackEnd {
-        BackEnd { pool }
+        BackEnd {
+            pool,
+            queue_name: super::TASUKI_DEFAULT_QUEUE_NAME.into(),
+        }
+    }
+
+    pub fn queue_name<S>(self, queue_name: S) -> Self
+    where
+        S: Into<std::borrow::Cow<'static, str>>,
+    {
+        Self {
+            queue_name: queue_name.into(),
+            ..self
+        }
     }
 
     async fn get_job<T>(&self, batch_size: u16) -> Vec<Result<Job<T>, Error>>
@@ -159,6 +173,7 @@ impl BackEnd {
         let builder = queries::GetAvailableJobs::builder()
             .batch_size(batch_size.into())
             .lease_interval(&LEASE_INTERVAL)
+            .queue_name(&self.queue_name)
             .build();
 
         builder
@@ -392,10 +407,8 @@ where
         }
     }
 
-    pub fn build_with_data<F, Fut, T>(self, f: F) -> Worker<Tick, F, Ctx, T, JobData<T>>
+    pub fn build_with_data<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, JobData<T>>
     where
-        F: FnOnce(JobData<T>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = JobResult> + Send + 'static,
         F: JobHandler<T, Ctx, JobData<T>>,
         T: DeserializeOwned + 'static,
     {
@@ -408,10 +421,8 @@ where
         }
     }
 
-    pub fn build_with_ctx<F, Fut, T>(self, f: F) -> Worker<Tick, F, Ctx, T, WorkerContext<Ctx>>
+    pub fn build_with_ctx<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, Ctx>
     where
-        F: FnOnce(WorkerContext<Ctx>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = JobResult> + Send + 'static,
         F: JobHandler<T, Ctx, WorkerContext<Ctx>>,
         T: DeserializeOwned + 'static,
     {
@@ -424,13 +435,8 @@ where
         }
     }
 
-    pub fn build_with_both<F, Fut, T>(
-        self,
-        f: F,
-    ) -> Worker<Tick, F, Ctx, T, (JobData<T>, WorkerContext<Ctx>)>
+    pub fn build_with_both<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, (JobData<T>, Ctx)>
     where
-        F: FnOnce(JobData<T>, WorkerContext<Ctx>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = JobResult> + Send + 'static,
         F: JobHandler<T, Ctx, (JobData<T>, WorkerContext<Ctx>)>,
         T: DeserializeOwned + 'static,
     {

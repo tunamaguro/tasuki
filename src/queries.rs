@@ -86,6 +86,7 @@ pub struct GetAvailableJobsRow {
 }
 pub struct GetAvailableJobs<'a> {
     lease_interval: &'a sqlx::postgres::types::PgInterval,
+    queue_name: &'a str,
     batch_size: i32,
 }
 impl<'a> GetAvailableJobs<'a> {
@@ -108,10 +109,10 @@ WHERE
         (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
       )
       AND 
-      (scheduled_at <= NOW() AND attempts <= max_attempts)
+      (scheduled_at <= NOW() AND attempts <= max_attempts AND queue_name = $2::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
-    LIMIT $2
+    LIMIT $3
   )
 RETURNING j.id, j.job_data";
     pub fn query_as(
@@ -124,6 +125,7 @@ RETURNING j.id, j.job_data";
     > {
         sqlx::query_as::<_, GetAvailableJobsRow>(Self::QUERY)
             .bind(self.lease_interval)
+            .bind(self.queue_name)
             .bind(self.batch_size)
     }
     pub async fn query_many<'b, A>(
@@ -139,45 +141,63 @@ RETURNING j.id, j.job_data";
     }
 }
 impl<'a> GetAvailableJobs<'a> {
-    pub const fn builder() -> GetAvailableJobsBuilder<'a, ((), ())> {
+    pub const fn builder() -> GetAvailableJobsBuilder<'a, ((), (), ())> {
         GetAvailableJobsBuilder {
-            fields: ((), ()),
+            fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct GetAvailableJobsBuilder<'a, Fields = ((), ())> {
+pub struct GetAvailableJobsBuilder<'a, Fields = ((), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, BatchSize> GetAvailableJobsBuilder<'a, ((), BatchSize)> {
+impl<'a, QueueName, BatchSize> GetAvailableJobsBuilder<'a, ((), QueueName, BatchSize)> {
     pub fn lease_interval(
         self,
         lease_interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, BatchSize)> {
-        let ((), batch_size) = self.fields;
+    ) -> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, QueueName, BatchSize)>
+    {
+        let ((), queue_name, batch_size) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
-            fields: (lease_interval, batch_size),
+            fields: (lease_interval, queue_name, batch_size),
             _phantom,
         }
     }
 }
-impl<'a, LeaseInterval> GetAvailableJobsBuilder<'a, (LeaseInterval, ())> {
-    pub fn batch_size(self, batch_size: i32) -> GetAvailableJobsBuilder<'a, (LeaseInterval, i32)> {
-        let (lease_interval, ()) = self.fields;
+impl<'a, LeaseInterval, BatchSize> GetAvailableJobsBuilder<'a, (LeaseInterval, (), BatchSize)> {
+    pub fn queue_name(
+        self,
+        queue_name: &'a str,
+    ) -> GetAvailableJobsBuilder<'a, (LeaseInterval, &'a str, BatchSize)> {
+        let (lease_interval, (), batch_size) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
-            fields: (lease_interval, batch_size),
+            fields: (lease_interval, queue_name, batch_size),
             _phantom,
         }
     }
 }
-impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, i32)> {
+impl<'a, LeaseInterval, QueueName> GetAvailableJobsBuilder<'a, (LeaseInterval, QueueName, ())> {
+    pub fn batch_size(
+        self,
+        batch_size: i32,
+    ) -> GetAvailableJobsBuilder<'a, (LeaseInterval, QueueName, i32)> {
+        let (lease_interval, queue_name, ()) = self.fields;
+        let _phantom = self._phantom;
+        GetAvailableJobsBuilder {
+            fields: (lease_interval, queue_name, batch_size),
+            _phantom,
+        }
+    }
+}
+impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a str, i32)> {
     pub const fn build(self) -> GetAvailableJobs<'a> {
-        let (lease_interval, batch_size) = self.fields;
+        let (lease_interval, queue_name, batch_size) = self.fields;
         GetAvailableJobs {
             lease_interval,
+            queue_name,
             batch_size,
         }
     }
@@ -486,13 +506,14 @@ pub struct InsertJobOneRow {}
 pub struct InsertJobOne<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
+    queue_name: &'a str,
 }
 impl<'a> InsertJobOne<'a> {
     pub const QUERY: &'static str = r"INSERT INTO
   tasuki_job
-  (max_attempts, job_data)
+  (max_attempts, job_data, queue_name)
 VALUES
-  ($1,$2)";
+  ($1, $2, $3)";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -504,6 +525,7 @@ VALUES
         sqlx::query_as::<_, InsertJobOneRow>(Self::QUERY)
             .bind(self.max_attempts)
             .bind(self.job_data)
+            .bind(self.queue_name)
     }
     pub async fn execute<'b, A>(
         &'a self,
@@ -516,51 +538,69 @@ VALUES
         sqlx::query(Self::QUERY)
             .bind(self.max_attempts)
             .bind(self.job_data)
+            .bind(self.queue_name)
             .execute(&mut *conn)
             .await
     }
 }
 impl<'a> InsertJobOne<'a> {
-    pub const fn builder() -> InsertJobOneBuilder<'a, ((), ())> {
+    pub const fn builder() -> InsertJobOneBuilder<'a, ((), (), ())> {
         InsertJobOneBuilder {
-            fields: ((), ()),
+            fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct InsertJobOneBuilder<'a, Fields = ((), ())> {
+pub struct InsertJobOneBuilder<'a, Fields = ((), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, JobData> InsertJobOneBuilder<'a, ((), JobData)> {
-    pub fn max_attempts(self, max_attempts: i32) -> InsertJobOneBuilder<'a, (i32, JobData)> {
-        let ((), job_data) = self.fields;
+impl<'a, JobData, QueueName> InsertJobOneBuilder<'a, ((), JobData, QueueName)> {
+    pub fn max_attempts(
+        self,
+        max_attempts: i32,
+    ) -> InsertJobOneBuilder<'a, (i32, JobData, QueueName)> {
+        let ((), job_data, queue_name) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
-            fields: (max_attempts, job_data),
+            fields: (max_attempts, job_data, queue_name),
             _phantom,
         }
     }
 }
-impl<'a, MaxAttempts> InsertJobOneBuilder<'a, (MaxAttempts, ())> {
+impl<'a, MaxAttempts, QueueName> InsertJobOneBuilder<'a, (MaxAttempts, (), QueueName)> {
     pub fn job_data(
         self,
         job_data: &'a serde_json::Value,
-    ) -> InsertJobOneBuilder<'a, (MaxAttempts, &'a serde_json::Value)> {
-        let (max_attempts, ()) = self.fields;
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName)> {
+        let (max_attempts, (), queue_name) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
-            fields: (max_attempts, job_data),
+            fields: (max_attempts, job_data, queue_name),
             _phantom,
         }
     }
 }
-impl<'a> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value)> {
+impl<'a, MaxAttempts, JobData> InsertJobOneBuilder<'a, (MaxAttempts, JobData, ())> {
+    pub fn queue_name(
+        self,
+        queue_name: &'a str,
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, &'a str)> {
+        let (max_attempts, job_data, ()) = self.fields;
+        let _phantom = self._phantom;
+        InsertJobOneBuilder {
+            fields: (max_attempts, job_data, queue_name),
+            _phantom,
+        }
+    }
+}
+impl<'a> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value, &'a str)> {
     pub const fn build(self) -> InsertJobOne<'a> {
-        let (max_attempts, job_data) = self.fields;
+        let (max_attempts, job_data, queue_name) = self.fields;
         InsertJobOne {
             max_attempts,
             job_data,
+            queue_name,
         }
     }
 }

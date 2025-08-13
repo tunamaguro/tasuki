@@ -86,6 +86,7 @@ impl std::error::Error for Error {
 #[derive(Debug)]
 pub struct Client<T> {
     pool: sqlx::PgPool,
+    queue_name: std::borrow::Cow<'static, str>,
     data_type: std::marker::PhantomData<T>,
 }
 
@@ -93,30 +94,44 @@ impl<T> Clone for Client<T> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            queue_name: self.queue_name.clone(),
             data_type: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Client<T> {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            pool,
+            queue_name: super::TASUKI_DEFAULT_QUEUE_NAME.into(),
+            data_type: std::marker::PhantomData,
+        }
+    }
+
+    pub fn queue_name<S>(self, queue_name: S) -> Self
+    where
+        S: Into<std::borrow::Cow<'static, str>>,
+    {
+        Self {
+            queue_name: queue_name.into(),
+            ..self
         }
     }
 }
 
 impl<T> Client<T>
 where
-    T: Serialize + Send + 'static,
+    T: Serialize + Send + Sync + 'static,
 {
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self {
-            pool,
-            data_type: std::marker::PhantomData,
-        }
-    }
-
     pub fn insert(
         &self,
         data: InsertJob<T>,
     ) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        Self::insert_tx(data, &self.pool)
+        self.insert_tx(data, &self.pool)
     }
 
-    pub async fn insert_tx<'a, 'c, A>(data: InsertJob<T>, tx: A) -> Result<(), Error>
+    pub async fn insert_tx<'a, 'c, A>(&self, data: InsertJob<T>, tx: A) -> Result<(), Error>
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
     {
@@ -124,6 +139,7 @@ where
         queries::InsertJobOne::builder()
             .job_data(&value)
             .max_attempts(data.max_attempts.into())
+            .queue_name(&self.queue_name)
             .build()
             .execute(tx)
             .await?;

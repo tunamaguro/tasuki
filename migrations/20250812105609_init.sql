@@ -3,6 +3,7 @@ CREATE TYPE tasuki_job_status AS ENUM ('pending', 'running', 'completed', 'faile
 
 CREATE TABLE IF NOT EXISTS  tasuki_job (
     id  UUID NOT NULL DEFAULT gen_random_uuid(),
+    queue_name TEXT NOT NULL,
     status tasuki_job_status NOT NULL DEFAULT 'pending',
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
