@@ -211,6 +211,22 @@ impl BackEnd {
             .collect::<Vec<_>>()
             .await
     }
+
+    fn into_datastream<S, T>(
+        self,
+        tick: S,
+        batch_size: u16,
+    ) -> impl Stream<Item = Result<Job<T>, Error>>
+    where
+        S: Stream,
+        T: DeserializeOwned,
+    {
+        tick.then(move |_| {
+            let backend = self.clone();
+            async move { backend.get_job::<T>(batch_size).await }
+        })
+        .flat_map(futures::stream::iter)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -227,13 +243,19 @@ pub enum JobResult {
 /// Trait implemented by functions that process a job.
 ///
 /// The `M` type parameter determines which combination of [`JobData`] and
-/// [`WorkerContext`] the handler expects.
-pub trait JobHandler<T, S, M>: Send + Sync + Clone + 'static {
+/// [`WorkerContext`] the handler expects. The associated [`Data`] type
+/// specifies the payload that the job carries.
+pub trait JobHandler<M>: Send + Sync + Clone + 'static {
+    /// The job data type handled by this function.
+    type Data;
+    /// Type of the shared context provided to the handler.
+    type Context;
+
     /// Future returned by the handler.
     type Future: Future<Output = JobResult> + Send;
 
     /// Invoke the handler with the job data and worker context.
-    fn call(self, data: T, context: S) -> Self::Future;
+    fn call(self, data: Self::Data, context: Self::Context) -> Self::Future;
 }
 
 /// Wrapper passed to handlers that request the job payload.
@@ -242,50 +264,58 @@ pub struct JobData<T>(pub T);
 /// Wrapper passed to handlers that require access to shared context.
 pub struct WorkerContext<S>(pub S);
 
-impl<F, Fut, T, S> JobHandler<T, S, ()> for F
+impl<F, Fut> JobHandler<()> for F
 where
     F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = JobResult> + Send,
 {
+    type Data = serde_json::Value;
+    type Context = ();
     type Future = Fut;
 
-    fn call(self, _data: T, _context: S) -> Self::Future {
+    fn call(self, _data: Self::Data, _context: Self::Context) -> Self::Future {
         self()
     }
 }
 
-impl<F, Fut, T, S> JobHandler<T, S, JobData<T>> for F
+impl<F, Fut, T> JobHandler<JobData<T>> for F
 where
     F: FnOnce(JobData<T>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = JobResult> + Send,
 {
+    type Data = T;
+    type Context = ();
     type Future = Fut;
 
-    fn call(self, data: T, _context: S) -> Self::Future {
+    fn call(self, data: Self::Data, _context: Self::Context) -> Self::Future {
         self(JobData(data))
     }
 }
 
-impl<F, Fut, T, S> JobHandler<T, S, WorkerContext<S>> for F
+impl<F, Fut, S> JobHandler<WorkerContext<S>> for F
 where
     F: FnOnce(WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = JobResult> + Send,
 {
+    type Data = serde_json::Value;
+    type Context = S;
     type Future = Fut;
 
-    fn call(self, _data: T, context: S) -> Self::Future {
+    fn call(self, _data: Self::Data, context: Self::Context) -> Self::Future {
         self(WorkerContext(context))
     }
 }
 
-impl<F, Fut, T, S> JobHandler<T, S, (JobData<T>, WorkerContext<S>)> for F
+impl<F, Fut, T, S> JobHandler<(JobData<T>, WorkerContext<S>)> for F
 where
     F: FnOnce(JobData<T>, WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = JobResult> + Send,
 {
+    type Data = T;
+    type Context = S;
     type Future = Fut;
 
-    fn call(self, data: T, context: S) -> Self::Future {
+    fn call(self, data: Self::Data, context: Self::Context) -> Self::Future {
         self(JobData(data), WorkerContext(context))
     }
 }
@@ -294,57 +324,118 @@ where
 /// Polls for jobs and executes them using the provided handler.
 ///
 /// The generic parameters allow customizing the ticker stream (`Tick`),
-/// job handler (`F`), shared context (`Ctx`), job payload (`T`) and marker
-/// type (`M`) that specifies which arguments are supplied to the handler.
-pub struct Worker<Tick, F, Ctx, T, M> {
+/// job handler (`F`), shared context (`Ctx`) and marker type (`M`) that
+/// specifies which arguments are supplied to the handler.
+pub struct Worker<Tick, F, Ctx, M> {
     tick: Tick,
     concurrent: usize,
     job_handler: F,
     context: Ctx,
-    data_type: std::marker::PhantomData<(T, M)>,
+    _marker: std::marker::PhantomData<M>,
 }
 
-impl<Tick, F, Ctx, T, M> Worker<Tick, F, Ctx, T, M>
+impl<Tick, F, Ctx, M> Worker<Tick, F, Ctx, M>
 where
     Tick: Stream,
-    F: JobHandler<T, Ctx, M>,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned + 'static,
     Ctx: Clone,
-    T: DeserializeOwned,
 {
-    fn data_stream(tick: Tick, backend: BackEnd) -> impl Stream<Item = Result<Job<T>, Error>> {
-        let backend = backend.clone();
-
-        tick.then(move |_| {
-            let backend = backend.clone();
-            async move { backend.get_job(8).await }
-        })
-        .flat_map(futures::stream::iter)
+    pub fn with_graceful_shutdown<Signal>(
+        self,
+        signal: Signal,
+    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
+    where
+        Signal: Future,
+    {
+        WorkerWithGracefulShutdown {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            _marker: self._marker,
+            signal,
+        }
     }
 
     /// Start polling the backend and executing jobs until the stream
     /// terminates.
     pub async fn run(self, backend: BackEnd) {
-        let data_stream = Self::data_stream(self.tick, backend);
-        let filtered = data_stream.filter_map(|result| async {
-            result
-                .inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
-                .ok()
-        });
+        run_worker(
+            self.tick,
+            self.job_handler,
+            self.context,
+            backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
 
-        let runner = filtered.map(|job| async {
-            let Job { context, data } = job;
+pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
+    tick: Tick,
+    concurrent: usize,
+    job_handler: F,
+    context: Ctx,
+    _marker: std::marker::PhantomData<M>,
+    signal: Signal,
+}
+
+impl<Tick, F, Ctx, M, Signal> WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal>
+where
+    Tick: Stream,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned + 'static,
+    Ctx: Clone,
+    Signal: Future,
+{
+    pub async fn run(self, backend: BackEnd) {
+        let tick = self.tick.take_until(self.signal);
+        run_worker(
+            tick,
+            self.job_handler,
+            self.context,
+            backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
+
+async fn run_worker<Tick, F, M, Ctx>(
+    tick: Tick,
+    handler: F,
+    worker_context: Ctx,
+    backend: BackEnd,
+    concurrent: usize,
+) where
+    Tick: Stream,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned,
+    Ctx: Clone,
+{
+    let data_stream = backend.into_datastream(tick, 8);
+
+    let filtered = data_stream.filter_map(|result| async {
+        result
+            .inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
+            .ok()
+    });
+
+    let runner = filtered.map(|job| async {
+            let Job { context:job_context, data } = job;
             tracing::trace!("Start handler");
             let result = {
                 let hb_every = LEASE_DURATION / 3;
                 let mut ticker = Ticker::new(hb_every).fuse();
 
-                let mut handler_fut = self.job_handler.clone().call(data, self.context.clone()).boxed().fuse();
+                let mut handler_fut = handler.clone().call(data, worker_context.clone()).boxed().fuse();
                 loop {
                     futures::select! {
                         res = handler_fut => break res,
                         _ = ticker.next() =>{
-                            let _res = context.heartbeat().await.inspect_err(
-                                |error| tracing::error!(error = %error, job_id = %context.id, "Failed to heartbeat job"),
+                            let _res = job_context.heartbeat().await.inspect_err(
+                                |error| tracing::error!(error = %error, job_id = %job_context.id, "Failed to heartbeat job"),
                             );
                         }
                     }
@@ -353,18 +444,15 @@ where
             tracing::trace!("Finish handler");
 
             let _ =match result {
-                JobResult::Complete => {context.complete().await.inspect_err(   |error| tracing::error!(error = %error, "Failed to complete job"))},
-                JobResult::Retry(duration) =>  {context.retry(duration).await.inspect_err(|error| tracing::error!(error = %error, "Failed to retry job"))},
-                JobResult::Cancel => {context.cancel().await.inspect_err(|error|tracing::error!(error = %error, "Failed to cancel job"))},
+                JobResult::Complete => {job_context.complete().await.inspect_err(   |error| tracing::error!(error = %error, "Failed to complete job"))},
+                JobResult::Retry(duration) =>  {job_context.retry(duration).await.inspect_err(|error| tracing::error!(error = %error, "Failed to retry job"))},
+                JobResult::Cancel => {job_context.cancel().await.inspect_err(|error|tracing::error!(error = %error, "Failed to cancel job"))},
             };
         });
 
-        let fut = runner
-            .buffer_unordered(self.concurrent)
-            .for_each(|_| async {});
+    let fut = runner.buffer_unordered(concurrent).for_each(|_| async {});
 
-        fut.await
-    }
+    fut.await
 }
 
 /// Builder for configuring and constructing [`Worker`] instances.
@@ -442,65 +530,16 @@ where
     Tick: Stream,
     Ctx: Clone,
 {
-    /// Build a [`Worker`] for handlers that take no arguments.
-    pub fn build_noarg<F>(self, f: F) -> Worker<Tick, F, Ctx, (), ()>
+    pub fn build<F, M>(self, f: F) -> Worker<Tick, F, Ctx, M>
     where
-        F: JobHandler<(), Ctx, ()>,
+        F: JobHandler<M, Context = Ctx>,
     {
         Worker {
             tick: self.tick,
             concurrent: self.concurrent,
             job_handler: f,
             context: self.context,
-            data_type: std::marker::PhantomData,
-        }
-    }
-
-    /// Build a [`Worker`] for handlers that consume job data.
-    pub fn build_with_data<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, JobData<T>>
-    where
-        F: JobHandler<T, Ctx, JobData<T>>,
-        T: DeserializeOwned + 'static,
-    {
-        Worker {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: f,
-            context: self.context,
-            data_type: std::marker::PhantomData,
-        }
-    }
-
-    /// Build a [`Worker`] for handlers that use the shared context.
-    pub fn build_with_ctx<F, T>(self, f: F) -> Worker<Tick, F, Ctx, T, WorkerContext<Ctx>>
-    where
-        F: JobHandler<T, Ctx, WorkerContext<Ctx>>,
-        T: DeserializeOwned + 'static,
-    {
-        Worker {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: f,
-            context: self.context,
-            data_type: std::marker::PhantomData,
-        }
-    }
-
-    /// Build a [`Worker`] for handlers that require both job data and context.
-    pub fn build_with_both<F, T>(
-        self,
-        f: F,
-    ) -> Worker<Tick, F, Ctx, T, (JobData<T>, WorkerContext<Ctx>)>
-    where
-        F: JobHandler<T, Ctx, (JobData<T>, WorkerContext<Ctx>)>,
-        T: DeserializeOwned + 'static,
-    {
-        Worker {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: f,
-            context: self.context,
-            data_type: std::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         }
     }
 }
