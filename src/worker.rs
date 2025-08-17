@@ -92,6 +92,7 @@ trait ThrottleExt: Stream {
     }
 
     /// Same as [`throttle`] but with a custom ticker stream.
+    #[allow(unused)]
     fn throttle_with_tick<Tick>(self, ticker: Tick, max_count: usize) -> Throttle<Self, Tick>
     where
         Self: Sized,

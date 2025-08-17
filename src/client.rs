@@ -170,6 +170,7 @@ where
     }
 
     /// Insert a job using an existing transaction or connection.
+    #[allow(clippy::manual_async_fn)]
     pub fn insert_tx<'a, 'c, A>(
         &self,
         data: InsertJob<T>,

@@ -1,4 +1,4 @@
-#[allow(unused)]
+#[allow(unused, clippy::manual_async_fn)]
 mod queries;
 
 const TASUKI_DEFAULT_QUEUE_NAME: &str = "tasuki_default";
