@@ -26,6 +26,11 @@
                                 "db_type": "uuid",
                                 "rs_type": "sqlx::types::Uuid",
                                 "copy_cheap": true
+                            },
+                            {
+                                "db_type": "void",
+                                "rs_type": "()",
+                                "copy_cheap": true
                             }
                         ]
                     }

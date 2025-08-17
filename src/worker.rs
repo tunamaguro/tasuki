@@ -5,9 +5,9 @@
 //! [`BackEnd`] at a fixed interval and drives job handlers to completion
 //! while periodically sending heartbeats to maintain job leases.
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
 use pin_project_lite::pin_project;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::queries;
 
@@ -46,6 +46,113 @@ impl Stream for Ticker {
     }
 }
 
+pin_project! {
+    /// Rate-limits the stream; items beyond the limit are dropped.
+    pub struct Throttle<St, Tick> {
+        #[pin]
+        inner: St,
+        #[pin]
+        ticker: Tick,
+        max_count: usize,
+        // Number of items issued in the current window
+        issued_in_window: usize,
+    }
+}
+
+impl<St, Tick> Throttle<St, Tick> {
+    /// Create a throttling adapter over `stream`.
+    ///
+    /// - `duration`: length of each rate-limiting window.
+    /// - `max_count`: maximum number of items to forward per window.
+    fn new(stream: St, duration: std::time::Duration, max_count: usize) -> Throttle<St, Ticker> {
+        Throttle::new_with_tick(stream, Ticker::new(duration), max_count)
+    }
+
+    /// Create a throttling adapter with a custom ticker stream.
+    fn new_with_tick(stream: St, ticker: Tick, max_count: usize) -> Throttle<St, Tick> {
+        Throttle {
+            inner: stream,
+            ticker,
+            max_count,
+            issued_in_window: 0,
+        }
+    }
+}
+
+trait ThrottleExt: Stream {
+    /// Forward at most `max_count` items per `duration`; drop excess.
+    ///
+    /// ## Note
+    /// No buffering is performed.
+    fn throttle(self, duration: std::time::Duration, max_count: usize) -> Throttle<Self, Ticker>
+    where
+        Self: Sized,
+    {
+        Throttle::<Self, Ticker>::new(self, duration, max_count)
+    }
+
+    /// Same as [`throttle`] but with a custom ticker stream.
+    #[allow(unused)]
+    fn throttle_with_tick<Tick>(self, ticker: Tick, max_count: usize) -> Throttle<Self, Tick>
+    where
+        Self: Sized,
+        Tick: Stream,
+    {
+        Throttle::new_with_tick(self, ticker, max_count)
+    }
+}
+
+impl<St, Tick> Stream for Throttle<St, Tick>
+where
+    St: Stream,
+    Tick: Stream,
+{
+    type Item = St::Item;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        // Waker semantics: when throttled, we return Pending after polling the
+        // ticker, so the task is woken by the next tick. When not throttled, we
+        // poll the inner stream and forward readiness.
+
+        // First, poll the ticker to see if a new window started.
+        // If it ticked, reset the counter so a fresh burst is allowed.
+        match this.ticker.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(_)) => {
+                *this.issued_in_window = 0;
+            }
+            std::task::Poll::Ready(None) => {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending => {}
+        }
+
+        // Otherwise forward to inner stream and count one if we yield an item.
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                if *this.issued_in_window >= *this.max_count {
+                    return std::task::Poll::Pending;
+                }
+
+                *this.issued_in_window += 1;
+                std::task::Poll::Ready(Some(item))
+            }
+            other => other,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Delegates size hints; throttle can only reduce throughput.
+        self.inner.size_hint()
+    }
+}
+
+// Allow any Stream to call `.throttle(...)`.
+impl<St> ThrottleExt for St where St: Stream {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Categorization of failures that may occur while processing jobs.
 pub enum ErrorKind {
@@ -56,7 +163,7 @@ pub enum ErrorKind {
 }
 
 #[derive(Debug)]
-struct Error {
+pub struct Error {
     #[allow(unused)]
     kind: ErrorKind,
     inner: Box<dyn std::error::Error + Send + 'static>,
@@ -89,6 +196,123 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.inner.as_ref())
+    }
+}
+
+#[derive(Debug)]
+pub struct Listener {
+    inner: sqlx::postgres::PgListener,
+    publishers: std::collections::HashMap<String, Publisher>,
+}
+
+impl Listener {
+    pub(crate) const CHANNEL_NAME: &str = "tasuki_jobs";
+    async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+        listener.listen(Self::CHANNEL_NAME).await?;
+
+        Ok(Self {
+            inner: listener,
+            publishers: Default::default(),
+        })
+    }
+
+    /// Listen for notifications until the provided `signal` completes.
+    ///
+    /// This is a graceful variant of [`listen`]; it exits when either
+    /// the database notification stream ends, an error occurs, or the
+    /// `signal` resolves (e.g., on shutdown).
+    pub async fn listen_until<Signal>(self, signal: Signal) -> Result<(), Error>
+    where
+        Signal: std::future::Future,
+    {
+        let mut stream = self.inner.into_stream().fuse();
+        let mut publisers = self.publishers;
+        let signal = signal.fuse();
+        futures::pin_mut!(signal);
+
+        #[derive(Debug, Deserialize)]
+        struct ChannelData {
+            q: String,
+        }
+
+        loop {
+            futures::select! {
+                _ = &mut signal => {
+                    break;
+                }
+                msg = stream.try_next() => {
+                    match msg {
+                        Ok(Some(notification)) => {
+                            let payload = notification.payload();
+                            let data = serde_json::from_str::<ChannelData>(payload).inspect_err(|error|tracing::error!(error = %error,"Cannot deserialize job notify message"));
+                            let Ok(data) = data else {
+                                continue;
+                            };
+
+                            if let Some(publisher) = publisers.get_mut(&data.q) {
+                                let queue_name = publisher.name.as_ref();
+                                let _ = publisher.sender.send(()).await.inspect_err(|error|tracing::error!(error = %error, queue_name = queue_name, "Cannot send job notify"));
+                            }
+                        }
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "Error happen when receive message from channel");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn listen(self) -> Result<(), Error> {
+        self.listen_until(std::future::pending::<()>()).await
+    }
+
+    fn subscribe(&mut self, queue_name: impl Into<std::borrow::Cow<'static, str>>) -> Subscribe {
+        let queue_name = queue_name.into();
+        let (tx, rx) = futures::channel::mpsc::channel(32);
+        let publisher = Publisher {
+            name: queue_name,
+            sender: tx,
+        };
+        self.publishers
+            .insert(publisher.name.to_string(), publisher);
+
+        Subscribe { receiver: rx }
+    }
+}
+
+#[derive(Debug)]
+struct Publisher {
+    sender: futures::channel::mpsc::Sender<()>,
+    name: std::borrow::Cow<'static, str>,
+}
+
+pin_project! {
+    #[derive(Debug)]
+    struct Subscribe {
+        #[pin]
+        receiver: futures::channel::mpsc::Receiver<()>,
+    }
+}
+
+impl Stream for Subscribe {
+    type Item = ();
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.receiver.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.receiver.size_hint()
     }
 }
 
@@ -182,6 +406,10 @@ impl BackEnd {
             queue_name: queue_name.into(),
             ..self
         }
+    }
+
+    pub async fn listener(&self) -> Result<Listener, sqlx::Error> {
+        Listener::new(self.pool.clone()).await
     }
 
     async fn get_job<T>(&self, batch_size: u16) -> Vec<Result<Job<T>, Error>>
@@ -332,12 +560,13 @@ pub struct Worker<Tick, F, Ctx, M> {
     concurrent: usize,
     job_handler: F,
     context: Ctx,
+    backend: BackEnd,
     _marker: std::marker::PhantomData<M>,
 }
 
 impl<Tick, F, Ctx, M> Worker<Tick, F, Ctx, M>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
     F::Data: DeserializeOwned + 'static,
     Ctx: Clone,
@@ -345,7 +574,7 @@ where
     pub fn with_graceful_shutdown<Signal>(
         self,
         signal: Signal,
-    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
+    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
     where
         Signal: Future,
     {
@@ -354,19 +583,97 @@ where
             concurrent: self.concurrent,
             job_handler: self.job_handler,
             context: self.context,
+            backend: self.backend,
             _marker: self._marker,
             signal,
         }
     }
 
+    /// Combine periodic ticks with DB LISTEN notifications and apply a
+    /// small throttle to coalesce bursts.
+    ///
+    /// Notes
+    /// - The resulting stream is throttled to at most 1 event every
+    ///   100ms. This protects the database from hot loops when many
+    ///   notifications arrive at once and reduces redundant fetches.
+    pub fn subscribe(
+        self,
+        listener: &mut Listener,
+    ) -> WorkerWithSubscribe<impl Stream<Item = ()> + use<Tick, F, Ctx, M>, F, Ctx, M> {
+        let subscribe = listener.subscribe(self.backend.queue_name.clone());
+        let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe)
+            .throttle(std::time::Duration::from_millis(100), 1);
+
+        WorkerWithSubscribe {
+            tick: tick_stream,
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            backend: self.backend,
+            _marker: self._marker,
+        }
+    }
+
     /// Start polling the backend and executing jobs until the stream
     /// terminates.
-    pub async fn run(self, backend: BackEnd) {
+    pub async fn run(self) {
         run_worker(
             self.tick,
             self.job_handler,
             self.context,
-            backend,
+            self.backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
+
+pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
+    /// Tick stream that is already throttled.
+    ///
+    /// This worker variant applies a built-in throttle of 1 event per 100ms
+    /// to the combined tick/subscribe stream created by [`Worker::subscribe`].
+    /// This is intentional to limit fetch frequency during notification
+    /// bursts and prevent tight polling loops.
+    tick: Throttle<Tick, Ticker>,
+    concurrent: usize,
+    job_handler: F,
+    context: Ctx,
+    backend: BackEnd,
+    _marker: std::marker::PhantomData<M>,
+}
+
+impl<Tick, F, Ctx, M> WorkerWithSubscribe<Tick, F, Ctx, M>
+where
+    Tick: Stream<Item = ()>,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned + 'static,
+    Ctx: Clone + Send,
+{
+    pub fn with_graceful_shutdown<Signal>(
+        self,
+        signal: Signal,
+    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
+    where
+        Signal: Future,
+    {
+        WorkerWithGracefulShutdown {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            backend: self.backend,
+            _marker: self._marker,
+            signal,
+        }
+    }
+
+    pub async fn run(self) {
+        run_worker(
+            self.tick,
+            self.job_handler,
+            self.context,
+            self.backend,
             self.concurrent,
         )
         .await
@@ -378,25 +685,26 @@ pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
     concurrent: usize,
     job_handler: F,
     context: Ctx,
+    backend: BackEnd,
     _marker: std::marker::PhantomData<M>,
     signal: Signal,
 }
 
 impl<Tick, F, Ctx, M, Signal> WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned + 'static,
+    F::Data: DeserializeOwned + Send + 'static,
     Ctx: Clone,
     Signal: Future,
 {
-    pub async fn run(self, backend: BackEnd) {
+    pub async fn run(self) {
         let tick = self.tick.take_until(self.signal);
         run_worker(
             tick,
             self.job_handler,
             self.context,
-            backend,
+            self.backend,
             self.concurrent,
         )
         .await
@@ -410,7 +718,7 @@ async fn run_worker<Tick, F, M, Ctx>(
     backend: BackEnd,
     concurrent: usize,
 ) where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
     F::Data: DeserializeOwned,
     Ctx: Clone,
@@ -466,7 +774,7 @@ async fn run_worker<Tick, F, M, Ctx>(
 
     let tick = tick.fuse();
     futures::pin_mut!(tick);
-    let mut tasks: futures::stream::FuturesUnordered<_> = futures::stream::FuturesUnordered::new();
+    let mut tasks = futures::stream::FuturesUnordered::new();
     let mut in_flight: usize = 0;
 
     loop {
@@ -521,7 +829,7 @@ impl Default for WorkerBuilder<Ticker, ()> {
 impl WorkerBuilder<Ticker, ()> {
     /// Create a new builder with default configuration.
     pub fn new() -> Self {
-        let ticker = Ticker::new(std::time::Duration::from_secs(1));
+        let ticker = Ticker::new(std::time::Duration::from_secs(5));
         WorkerBuilder {
             tick: ticker,
             context: (),
@@ -534,7 +842,7 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
     /// Replace the ticker driving the polling loop.
     pub fn tick<Tick2>(self, tick: Tick2) -> WorkerBuilder<Tick2, Ctx>
     where
-        Tick2: Stream,
+        Tick2: Stream<Item = ()>,
     {
         WorkerBuilder {
             tick,
@@ -574,10 +882,10 @@ impl<Ctx> WorkerBuilder<Ticker, Ctx> {
 
 impl<Tick, Ctx> WorkerBuilder<Tick, Ctx>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     Ctx: Clone,
 {
-    pub fn build<F, M>(self, f: F) -> Worker<Tick, F, Ctx, M>
+    pub fn build<F, M>(self, backend: BackEnd, f: F) -> Worker<Tick, F, Ctx, M>
     where
         F: JobHandler<M, Context = Ctx>,
     {
@@ -586,7 +894,73 @@ where
             concurrent: self.concurrent,
             job_handler: f,
             context: self.context,
+            backend,
             _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    // Helper stream that yields an infinite counter as fast as it's polled.
+    fn make_counter() -> impl Stream<Item = usize> {
+        futures::stream::unfold(0usize, |i| async move { Some((i, i + 1)) })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_limits_items_per_window() {
+        // Window = 200ms, max = 2
+        let counter_st = make_counter();
+        let interval = tokio::time::interval(Duration::from_millis(200));
+
+        let throttled =
+            counter_st.throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 2);
+        tokio::pin!(throttled);
+
+        // First window allows 2 items
+        let v = throttled.next().await.unwrap();
+        assert_eq!(v, 0);
+        let v = throttled.next().await.unwrap();
+        assert_eq!(v, 1);
+
+        // Further item within the same window should be throttled (dropped/pending)
+        // Ensure we don't get a third item before the 200ms window elapses
+        let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+        assert!(res.is_err(), "item was yielded before the window reset");
+
+        // Advance into the next window boundary
+        tokio::time::advance(Duration::from_millis(1)).await; // total advanced: 200ms
+
+        // After window resets, next item arrives
+        let _ = throttled.next().await.unwrap();
+        // And the second item in the new window also arrives
+        let _ = throttled.next().await.unwrap();
+
+        // A third item in the same window should again be throttled
+        let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+        assert!(res.is_err(), "more than max items passed in a window");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_zero_limit_yields_nothing() {
+        // Window = 200ms, max = 0 -> nothing should ever pass through
+        let counter_st = make_counter();
+        let interval = tokio::time::interval(Duration::from_millis(200));
+
+        let throttled =
+            counter_st.throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 0);
+        tokio::pin!(throttled);
+
+        // Verify across several windows that no item is yielded
+        for _ in 0..3 {
+            let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+            assert!(res.is_err(), "stream yielded despite zero limit");
+            // Cross window boundary
+            tokio::time::advance(Duration::from_millis(1)).await;
         }
     }
 }

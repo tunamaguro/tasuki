@@ -144,26 +144,62 @@ where
     T: Serialize + Send + Sync + 'static,
 {
     /// Insert a job into the queue using the client's connection pool.
-    pub fn insert(
-        &self,
-        data: InsertJob<T>,
-    ) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        self.insert_tx(data, &self.pool)
-    }
-
-    /// Insert a job using an existing transaction or connection.
-    pub async fn insert_tx<'a, 'c, A>(&self, data: InsertJob<T>, tx: A) -> Result<(), Error>
-    where
-        A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
-    {
+    pub async fn insert(&self, data: InsertJob<T>) -> Result<(), Error> {
         let value = serde_json::to_value(data.data)?;
+
+        let mut tx = self.pool.begin().await?;
+
         queries::InsertJobOne::builder()
             .job_data(&value)
             .max_attempts(data.max_attempts.into())
             .queue_name(&self.queue_name)
             .build()
-            .execute(tx)
+            .execute(&mut *tx)
             .await?;
+
+        queries::AddJobNotify::builder()
+            .channel_name(crate::worker::Listener::CHANNEL_NAME)
+            .queue_name(&self.queue_name)
+            .build()
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
         Ok(())
+    }
+
+    /// Insert a job using an existing transaction or connection.
+    #[allow(clippy::manual_async_fn)]
+    pub fn insert_tx<'a, 'c, A>(
+        &self,
+        data: InsertJob<T>,
+        tx: A,
+    ) -> impl Future<Output = Result<(), Error>>
+    where
+        A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let value = serde_json::to_value(data.data)?;
+
+            let mut conn = tx.acquire().await?;
+
+            queries::InsertJobOne::builder()
+                .job_data(&value)
+                .max_attempts(data.max_attempts.into())
+                .queue_name(&self.queue_name)
+                .build()
+                .execute(&mut *conn)
+                .await?;
+
+            queries::AddJobNotify::builder()
+                .queue_name(&self.queue_name)
+                .channel_name(crate::worker::Listener::CHANNEL_NAME)
+                .build()
+                .execute(&mut *conn)
+                .await?;
+
+            Ok(())
+        }
     }
 }

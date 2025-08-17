@@ -1,3 +1,4 @@
+use futures::FutureExt;
 use tasuki::{BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext};
 
 #[tokio::main]
@@ -7,29 +8,43 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
+    let token = tokio_util::sync::CancellationToken::new();
+
     let pool = sqlx::PgPool::connect("postgres://root:password@postgres:5432/app")
         .await
         .unwrap();
 
     let backend = BackEnd::new(pool.clone());
-    let worker = WorkerBuilder::new().build(backend, job_handler);
+    let mut listener = backend.listener().await.unwrap();
+
+    let worker = WorkerBuilder::new()
+        .build(backend, job_handler)
+        .subscribe(&mut listener)
+        .with_graceful_shutdown(token.clone().cancelled_owned());
 
     let client = Client::<u64>::new(pool.clone());
+    let client_token = token.clone();
     let client_handle = async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let mut n = 0;
         loop {
-            interval.tick().await;
-            let job = InsertJob::new(n);
-            match client.insert(job).await {
-                Ok(_) => {
-                    tracing::info!("Enqueue job {}", n);
-                    n += 1
+            tokio::select! {
+                _ = client_token.cancelled()=>{
+                    break;
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "Failed to enqueue job")
+                _ = interval.tick()=>{
+                    let job = InsertJob::new(n);
+                    match client.insert(job).await {
+                        Ok(_) => {
+                            tracing::info!("Enqueue job {}", n);
+                            n += 1
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "Failed to enqueue job")
+                        }
+                    };
                 }
-            };
+            }
         }
     };
 
@@ -37,7 +52,16 @@ async fn main() {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(client_handle);
     tasks.spawn(worker_fut);
-
+    // Stop the listener when the cancellation token is triggered (e.g., Ctrl+C)
+    tasks.spawn(
+        listener
+            .listen_until(token.clone().cancelled_owned())
+            .map(|_| ()),
+    );
+    tasks.spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        token.cancel();
+    });
     tasks.join_all().await;
 }
 
