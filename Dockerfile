@@ -11,5 +11,4 @@ RUN echo "source /usr/share/bash-completion/completions/git" >> /home/${USERNAME
 RUN echo "source <( rustup completions bash )" >> /home/${USERNAME}/.bashrc
 RUN echo "source <( rustup completions bash cargo )" >> /home/${USERNAME}/.bashrc
 
-RUN rustup component add rustfmt clippy
 RUN cargo install just sqlx-cli
