@@ -48,26 +48,31 @@ impl Stream for Ticker {
 
 pin_project! {
     /// Rate-limits the stream; items beyond the limit are dropped.
-    pub struct Throttle<St> {
+    pub struct Throttle<St, Tick> {
         #[pin]
         inner: St,
         #[pin]
-        ticker: Ticker,
+        ticker: Tick,
         max_count: usize,
         // Number of items issued in the current window
         issued_in_window: usize,
     }
 }
 
-impl<St> Throttle<St> {
+impl<St, Tick> Throttle<St, Tick> {
     /// Create a throttling adapter over `stream`.
     ///
     /// - `duration`: length of each rate-limiting window.
     /// - `max_count`: maximum number of items to forward per window.
-    fn new(stream: St, duration: std::time::Duration, max_count: usize) -> Self {
-        Self {
+    fn new(stream: St, duration: std::time::Duration, max_count: usize) -> Throttle<St, Ticker> {
+        Throttle::new_with_tick(stream, Ticker::new(duration), max_count)
+    }
+
+    /// Create a throttling adapter with a custom ticker stream.
+    fn new_with_tick(stream: St, ticker: Tick, max_count: usize) -> Throttle<St, Tick> {
+        Throttle {
             inner: stream,
-            ticker: Ticker::new(duration),
+            ticker,
             max_count,
             issued_in_window: 0,
         }
@@ -79,17 +84,27 @@ trait ThrottleExt: Stream {
     ///
     /// ## Note
     /// No buffering is performed.
-    fn throttle(self, duration: std::time::Duration, max_count: usize) -> Throttle<Self>
+    fn throttle(self, duration: std::time::Duration, max_count: usize) -> Throttle<Self, Ticker>
     where
         Self: Sized,
     {
-        Throttle::new(self, duration, max_count)
+        Throttle::<Self, Ticker>::new(self, duration, max_count)
+    }
+
+    /// Same as [`throttle`] but with a custom ticker stream.
+    fn throttle_with_tick<Tick>(self, ticker: Tick, max_count: usize) -> Throttle<Self, Tick>
+    where
+        Self: Sized,
+        Tick: Stream,
+    {
+        Throttle::new_with_tick(self, ticker, max_count)
     }
 }
 
-impl<St> Stream for Throttle<St>
+impl<St, Tick> Stream for Throttle<St, Tick>
 where
     St: Stream,
+    Tick: Stream,
 {
     type Item = St::Item;
     fn poll_next(
@@ -105,7 +120,7 @@ where
         // First, poll the ticker to see if a new window started.
         // If it ticked, reset the counter so a fresh burst is allowed.
         match this.ticker.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(())) => {
+            std::task::Poll::Ready(Some(_)) => {
                 *this.issued_in_window = 0;
             }
             std::task::Poll::Ready(None) => {
@@ -619,7 +634,7 @@ pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
     /// to the combined tick/subscribe stream created by [`Worker::subscribe`].
     /// This is intentional to limit fetch frequency during notification
     /// bursts and prevent tight polling loops.
-    tick: Throttle<Tick>,
+    tick: Throttle<Tick, Ticker>,
     concurrent: usize,
     job_handler: F,
     context: Ctx,
@@ -880,6 +895,71 @@ where
             context: self.context,
             backend,
             _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    // Helper stream that yields an infinite counter as fast as it's polled.
+    fn make_counter() -> impl Stream<Item = usize> {
+        futures::stream::unfold(0usize, |i| async move { Some((i, i + 1)) })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_limits_items_per_window() {
+        // Window = 200ms, max = 2
+        let counter_st = make_counter();
+        let interval = tokio::time::interval(Duration::from_millis(200));
+
+        let throttled =
+            counter_st.throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 2);
+        tokio::pin!(throttled);
+
+        // First window allows 2 items
+        let v = throttled.next().await.unwrap();
+        assert_eq!(v, 0);
+        let v = throttled.next().await.unwrap();
+        assert_eq!(v, 1);
+
+        // Further item within the same window should be throttled (dropped/pending)
+        // Ensure we don't get a third item before the 200ms window elapses
+        let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+        assert!(res.is_err(), "item was yielded before the window reset");
+
+        // Advance into the next window boundary
+        tokio::time::advance(Duration::from_millis(1)).await; // total advanced: 200ms
+
+        // After window resets, next item arrives
+        let _ = throttled.next().await.unwrap();
+        // And the second item in the new window also arrives
+        let _ = throttled.next().await.unwrap();
+
+        // A third item in the same window should again be throttled
+        let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+        assert!(res.is_err(), "more than max items passed in a window");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_zero_limit_yields_nothing() {
+        // Window = 200ms, max = 0 -> nothing should ever pass through
+        let counter_st = make_counter();
+        let interval = tokio::time::interval(Duration::from_millis(200));
+
+        let throttled = counter_st
+            .throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 0);
+        tokio::pin!(throttled);
+
+        // Verify across several windows that no item is yielded
+        for _ in 0..3 {
+            let res = tokio::time::timeout(Duration::from_millis(199), throttled.next()).await;
+            assert!(res.is_err(), "stream yielded despite zero limit");
+            // Cross window boundary
+            tokio::time::advance(Duration::from_millis(1)).await;
         }
     }
 }
