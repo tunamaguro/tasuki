@@ -83,6 +83,7 @@ pub enum TasukiJobStatus {
 pub struct GetAvailableJobsRow {
     pub id: sqlx::types::Uuid,
     pub job_data: serde_json::Value,
+    pub lease_token: Option<sqlx::types::Uuid>,
 }
 pub struct GetAvailableJobs<'a> {
     lease_interval: &'a sqlx::postgres::types::PgInterval,
@@ -95,7 +96,8 @@ impl<'a> GetAvailableJobs<'a> {
 SET
   status = 'running'::tasuki_job_status,
   attempts = j.attempts + 1,
-  lease_expires_at = clock_timestamp() + $1::INTERVAL
+  lease_expires_at = clock_timestamp() + $1::INTERVAL,
+  lease_token = gen_random_uuid()
 WHERE 
   id in (
     SELECT 
@@ -109,12 +111,12 @@ WHERE
         (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
       )
       AND 
-      (scheduled_at <= NOW() AND attempts <= max_attempts AND queue_name = $2::TEXT)
+      (scheduled_at <= NOW() AND attempts < max_attempts AND queue_name = $2::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $3
   )
-RETURNING j.id, j.job_data";
+RETURNING j.id, j.job_data, j.lease_token";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -207,16 +209,18 @@ impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a
 #[derive(sqlx::FromRow)]
 pub struct HeartBeatJobRow {}
 pub struct HeartBeatJob<'a> {
-    id: sqlx::types::Uuid,
     lease_interval: &'a sqlx::postgres::types::PgInterval,
+    id: sqlx::types::Uuid,
+    lease_token: Option<sqlx::types::Uuid>,
 }
 impl<'a> HeartBeatJob<'a> {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET
-  lease_expires_at = clock_timestamp() + $2::INTERVAL
+  lease_expires_at = clock_timestamp() + $1::INTERVAL
 WHERE
-  id = $1";
+  id = $2
+  AND lease_token = $3";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -226,8 +230,9 @@ WHERE
         <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
     > {
         sqlx::query_as::<_, HeartBeatJobRow>(Self::QUERY)
-            .bind(self.id)
             .bind(self.lease_interval)
+            .bind(self.id)
+            .bind(self.lease_token)
     }
     pub fn execute<'b, A>(
         &'a self,
@@ -241,61 +246,89 @@ WHERE
         async move {
             let mut conn = conn.acquire().await?;
             sqlx::query(Self::QUERY)
-                .bind(self.id)
                 .bind(self.lease_interval)
+                .bind(self.id)
+                .bind(self.lease_token)
                 .execute(&mut *conn)
                 .await
         }
     }
 }
 impl<'a> HeartBeatJob<'a> {
-    pub const fn builder() -> HeartBeatJobBuilder<'a, ((), ())> {
+    pub const fn builder() -> HeartBeatJobBuilder<'a, ((), (), ())> {
         HeartBeatJobBuilder {
-            fields: ((), ()),
+            fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct HeartBeatJobBuilder<'a, Fields = ((), ())> {
+pub struct HeartBeatJobBuilder<'a, Fields = ((), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, LeaseInterval> HeartBeatJobBuilder<'a, ((), LeaseInterval)> {
-    pub fn id(
-        self,
-        id: sqlx::types::Uuid,
-    ) -> HeartBeatJobBuilder<'a, (sqlx::types::Uuid, LeaseInterval)> {
-        let ((), lease_interval) = self.fields;
-        let _phantom = self._phantom;
-        HeartBeatJobBuilder {
-            fields: (id, lease_interval),
-            _phantom,
-        }
-    }
-}
-impl<'a, Id> HeartBeatJobBuilder<'a, (Id, ())> {
+impl<'a, Id, LeaseToken> HeartBeatJobBuilder<'a, ((), Id, LeaseToken)> {
     pub fn lease_interval(
         self,
         lease_interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> HeartBeatJobBuilder<'a, (Id, &'a sqlx::postgres::types::PgInterval)> {
-        let (id, ()) = self.fields;
+    ) -> HeartBeatJobBuilder<'a, (&'a sqlx::postgres::types::PgInterval, Id, LeaseToken)> {
+        let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         HeartBeatJobBuilder {
-            fields: (id, lease_interval),
+            fields: (lease_interval, id, lease_token),
             _phantom,
         }
     }
 }
-impl<'a> HeartBeatJobBuilder<'a, (sqlx::types::Uuid, &'a sqlx::postgres::types::PgInterval)> {
+impl<'a, LeaseInterval, LeaseToken> HeartBeatJobBuilder<'a, (LeaseInterval, (), LeaseToken)> {
+    pub fn id(
+        self,
+        id: sqlx::types::Uuid,
+    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, sqlx::types::Uuid, LeaseToken)> {
+        let (lease_interval, (), lease_token) = self.fields;
+        let _phantom = self._phantom;
+        HeartBeatJobBuilder {
+            fields: (lease_interval, id, lease_token),
+            _phantom,
+        }
+    }
+}
+impl<'a, LeaseInterval, Id> HeartBeatJobBuilder<'a, (LeaseInterval, Id, ())> {
+    pub fn lease_token(
+        self,
+        lease_token: Option<sqlx::types::Uuid>,
+    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, Id, Option<sqlx::types::Uuid>)> {
+        let (lease_interval, id, ()) = self.fields;
+        let _phantom = self._phantom;
+        HeartBeatJobBuilder {
+            fields: (lease_interval, id, lease_token),
+            _phantom,
+        }
+    }
+}
+impl<'a>
+    HeartBeatJobBuilder<
+        'a,
+        (
+            &'a sqlx::postgres::types::PgInterval,
+            sqlx::types::Uuid,
+            Option<sqlx::types::Uuid>,
+        ),
+    >
+{
     pub const fn build(self) -> HeartBeatJob<'a> {
-        let (id, lease_interval) = self.fields;
-        HeartBeatJob { id, lease_interval }
+        let (lease_interval, id, lease_token) = self.fields;
+        HeartBeatJob {
+            lease_interval,
+            id,
+            lease_token,
+        }
     }
 }
 #[derive(sqlx::FromRow)]
 pub struct CompleteJobRow {}
 pub struct CompleteJob {
     id: sqlx::types::Uuid,
+    lease_token: Option<sqlx::types::Uuid>,
 }
 impl CompleteJob {
     pub const QUERY: &'static str = r"UPDATE 
@@ -304,7 +337,8 @@ SET
   status = 'completed'::tasuki_job_status,
   lease_expires_at = NULL
 WHERE
-  id = $1";
+  id = $1
+  AND lease_token = $2";
     pub fn query_as<'a>(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -313,7 +347,9 @@ WHERE
         CompleteJobRow,
         <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
     > {
-        sqlx::query_as::<_, CompleteJobRow>(Self::QUERY).bind(self.id)
+        sqlx::query_as::<_, CompleteJobRow>(Self::QUERY)
+            .bind(self.id)
+            .bind(self.lease_token)
     }
     pub fn execute<'a, 'b, A>(
         &'a self,
@@ -328,43 +364,61 @@ WHERE
             let mut conn = conn.acquire().await?;
             sqlx::query(Self::QUERY)
                 .bind(self.id)
+                .bind(self.lease_token)
                 .execute(&mut *conn)
                 .await
         }
     }
 }
 impl CompleteJob {
-    pub const fn builder() -> CompleteJobBuilder<'static, ((),)> {
+    pub const fn builder() -> CompleteJobBuilder<'static, ((), ())> {
         CompleteJobBuilder {
-            fields: ((),),
+            fields: ((), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct CompleteJobBuilder<'a, Fields = ((),)> {
+pub struct CompleteJobBuilder<'a, Fields = ((), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a> CompleteJobBuilder<'a, ((),)> {
-    pub fn id(self, id: sqlx::types::Uuid) -> CompleteJobBuilder<'a, (sqlx::types::Uuid,)> {
-        let ((),) = self.fields;
+impl<'a, LeaseToken> CompleteJobBuilder<'a, ((), LeaseToken)> {
+    pub fn id(
+        self,
+        id: sqlx::types::Uuid,
+    ) -> CompleteJobBuilder<'a, (sqlx::types::Uuid, LeaseToken)> {
+        let ((), lease_token) = self.fields;
         let _phantom = self._phantom;
         CompleteJobBuilder {
-            fields: (id,),
+            fields: (id, lease_token),
             _phantom,
         }
     }
 }
-impl<'a> CompleteJobBuilder<'a, (sqlx::types::Uuid,)> {
+impl<'a, Id> CompleteJobBuilder<'a, (Id, ())> {
+    pub fn lease_token(
+        self,
+        lease_token: Option<sqlx::types::Uuid>,
+    ) -> CompleteJobBuilder<'a, (Id, Option<sqlx::types::Uuid>)> {
+        let (id, ()) = self.fields;
+        let _phantom = self._phantom;
+        CompleteJobBuilder {
+            fields: (id, lease_token),
+            _phantom,
+        }
+    }
+}
+impl<'a> CompleteJobBuilder<'a, (sqlx::types::Uuid, Option<sqlx::types::Uuid>)> {
     pub const fn build(self) -> CompleteJob {
-        let (id,) = self.fields;
-        CompleteJob { id }
+        let (id, lease_token) = self.fields;
+        CompleteJob { id, lease_token }
     }
 }
 #[derive(sqlx::FromRow)]
 pub struct CancelJobRow {}
 pub struct CancelJob {
     id: sqlx::types::Uuid,
+    lease_token: Option<sqlx::types::Uuid>,
 }
 impl CancelJob {
     pub const QUERY: &'static str = r"UPDATE
@@ -373,7 +427,8 @@ SET
   status = 'canceled'::tasuki_job_status,
   lease_expires_at = NULL
 WHERE
-  id = $1";
+  id = $1
+  AND lease_token = $2";
     pub fn query_as<'a>(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -382,7 +437,9 @@ WHERE
         CancelJobRow,
         <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
     > {
-        sqlx::query_as::<_, CancelJobRow>(Self::QUERY).bind(self.id)
+        sqlx::query_as::<_, CancelJobRow>(Self::QUERY)
+            .bind(self.id)
+            .bind(self.lease_token)
     }
     pub fn execute<'a, 'b, A>(
         &'a self,
@@ -397,63 +454,82 @@ WHERE
             let mut conn = conn.acquire().await?;
             sqlx::query(Self::QUERY)
                 .bind(self.id)
+                .bind(self.lease_token)
                 .execute(&mut *conn)
                 .await
         }
     }
 }
 impl CancelJob {
-    pub const fn builder() -> CancelJobBuilder<'static, ((),)> {
+    pub const fn builder() -> CancelJobBuilder<'static, ((), ())> {
         CancelJobBuilder {
-            fields: ((),),
+            fields: ((), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct CancelJobBuilder<'a, Fields = ((),)> {
+pub struct CancelJobBuilder<'a, Fields = ((), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a> CancelJobBuilder<'a, ((),)> {
-    pub fn id(self, id: sqlx::types::Uuid) -> CancelJobBuilder<'a, (sqlx::types::Uuid,)> {
-        let ((),) = self.fields;
+impl<'a, LeaseToken> CancelJobBuilder<'a, ((), LeaseToken)> {
+    pub fn id(
+        self,
+        id: sqlx::types::Uuid,
+    ) -> CancelJobBuilder<'a, (sqlx::types::Uuid, LeaseToken)> {
+        let ((), lease_token) = self.fields;
         let _phantom = self._phantom;
         CancelJobBuilder {
-            fields: (id,),
+            fields: (id, lease_token),
             _phantom,
         }
     }
 }
-impl<'a> CancelJobBuilder<'a, (sqlx::types::Uuid,)> {
+impl<'a, Id> CancelJobBuilder<'a, (Id, ())> {
+    pub fn lease_token(
+        self,
+        lease_token: Option<sqlx::types::Uuid>,
+    ) -> CancelJobBuilder<'a, (Id, Option<sqlx::types::Uuid>)> {
+        let (id, ()) = self.fields;
+        let _phantom = self._phantom;
+        CancelJobBuilder {
+            fields: (id, lease_token),
+            _phantom,
+        }
+    }
+}
+impl<'a> CancelJobBuilder<'a, (sqlx::types::Uuid, Option<sqlx::types::Uuid>)> {
     pub const fn build(self) -> CancelJob {
-        let (id,) = self.fields;
-        CancelJob { id }
+        let (id, lease_token) = self.fields;
+        CancelJob { id, lease_token }
     }
 }
 #[derive(sqlx::FromRow)]
 pub struct RetryJobRow {}
 pub struct RetryJob<'a> {
-    id: sqlx::types::Uuid,
     interval: Option<&'a sqlx::postgres::types::PgInterval>,
+    id: sqlx::types::Uuid,
+    lease_token: Option<sqlx::types::Uuid>,
 }
 impl<'a> RetryJob<'a> {
     pub const QUERY: &'static str = r"UPDATE tasuki_job j
 SET 
   status = CASE 
-            WHEN j.attempts <= j.max_attempts THEN 'pending'::tasuki_job_status
+            WHEN j.attempts < j.max_attempts THEN 'pending'::tasuki_job_status
             ELSE 'failed'::tasuki_job_status
            END,
   scheduled_at = CASE
-                  WHEN j.attempts <= j.max_attempts 
+                  WHEN j.attempts < j.max_attempts 
                     THEN clock_timestamp() + coalesce(
-                      $2,
-                      make_interval(secs := power(2.0, j.attempts) * (0.9 + random() * 0.2))
+                      $1,
+                      make_interval(secs := power(j.attempts, 4.0) * (0.9 + random() * 0.2))
                       )::INTERVAL
                   ELSE scheduled_at
                  END,
   lease_expires_at = NULL
 WHERE 
-  id = $1";
+  id = $2
+  AND lease_token = $3";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -463,8 +539,9 @@ WHERE
         <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
     > {
         sqlx::query_as::<_, RetryJobRow>(Self::QUERY)
-            .bind(self.id)
             .bind(self.interval)
+            .bind(self.id)
+            .bind(self.lease_token)
     }
     pub fn execute<'b, A>(
         &'a self,
@@ -478,44 +555,68 @@ WHERE
         async move {
             let mut conn = conn.acquire().await?;
             sqlx::query(Self::QUERY)
-                .bind(self.id)
                 .bind(self.interval)
+                .bind(self.id)
+                .bind(self.lease_token)
                 .execute(&mut *conn)
                 .await
         }
     }
 }
 impl<'a> RetryJob<'a> {
-    pub const fn builder() -> RetryJobBuilder<'a, ((), ())> {
+    pub const fn builder() -> RetryJobBuilder<'a, ((), (), ())> {
         RetryJobBuilder {
-            fields: ((), ()),
+            fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct RetryJobBuilder<'a, Fields = ((), ())> {
+pub struct RetryJobBuilder<'a, Fields = ((), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, Interval> RetryJobBuilder<'a, ((), Interval)> {
-    pub fn id(self, id: sqlx::types::Uuid) -> RetryJobBuilder<'a, (sqlx::types::Uuid, Interval)> {
-        let ((), interval) = self.fields;
+impl<'a, Id, LeaseToken> RetryJobBuilder<'a, ((), Id, LeaseToken)> {
+    pub fn interval(
+        self,
+        interval: Option<&'a sqlx::postgres::types::PgInterval>,
+    ) -> RetryJobBuilder<
+        'a,
+        (
+            Option<&'a sqlx::postgres::types::PgInterval>,
+            Id,
+            LeaseToken,
+        ),
+    > {
+        let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
-            fields: (id, interval),
+            fields: (interval, id, lease_token),
             _phantom,
         }
     }
 }
-impl<'a, Id> RetryJobBuilder<'a, (Id, ())> {
-    pub fn interval(
+impl<'a, Interval, LeaseToken> RetryJobBuilder<'a, (Interval, (), LeaseToken)> {
+    pub fn id(
         self,
-        interval: Option<&'a sqlx::postgres::types::PgInterval>,
-    ) -> RetryJobBuilder<'a, (Id, Option<&'a sqlx::postgres::types::PgInterval>)> {
-        let (id, ()) = self.fields;
+        id: sqlx::types::Uuid,
+    ) -> RetryJobBuilder<'a, (Interval, sqlx::types::Uuid, LeaseToken)> {
+        let (interval, (), lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
-            fields: (id, interval),
+            fields: (interval, id, lease_token),
+            _phantom,
+        }
+    }
+}
+impl<'a, Interval, Id> RetryJobBuilder<'a, (Interval, Id, ())> {
+    pub fn lease_token(
+        self,
+        lease_token: Option<sqlx::types::Uuid>,
+    ) -> RetryJobBuilder<'a, (Interval, Id, Option<sqlx::types::Uuid>)> {
+        let (interval, id, ()) = self.fields;
+        let _phantom = self._phantom;
+        RetryJobBuilder {
+            fields: (interval, id, lease_token),
             _phantom,
         }
     }
@@ -524,14 +625,19 @@ impl<'a>
     RetryJobBuilder<
         'a,
         (
-            sqlx::types::Uuid,
             Option<&'a sqlx::postgres::types::PgInterval>,
+            sqlx::types::Uuid,
+            Option<sqlx::types::Uuid>,
         ),
     >
 {
     pub const fn build(self) -> RetryJob<'a> {
-        let (id, interval) = self.fields;
-        RetryJob { id, interval }
+        let (interval, id, lease_token) = self.fields;
+        RetryJob {
+            interval,
+            id,
+            lease_token,
+        }
     }
 }
 #[derive(sqlx::FromRow)]
