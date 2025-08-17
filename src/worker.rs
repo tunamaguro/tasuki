@@ -951,8 +951,8 @@ mod tests {
         let counter_st = make_counter();
         let interval = tokio::time::interval(Duration::from_millis(200));
 
-        let throttled = counter_st
-            .throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 0);
+        let throttled =
+            counter_st.throttle_with_tick(tokio_stream::wrappers::IntervalStream::new(interval), 0);
         tokio::pin!(throttled);
 
         // Verify across several windows that no item is yielded
