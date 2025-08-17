@@ -16,7 +16,8 @@ async fn main() {
 
     let worker = WorkerBuilder::new()
         .build(backend, job_handler)
-        .subscribe(&mut listener);
+        .subscribe(&mut listener)
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await });
 
     let client = Client::<u64>::new(pool.clone());
     let client_handle = async move {

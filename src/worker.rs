@@ -464,7 +464,7 @@ where
     pub fn subscribe(
         self,
         listener: &mut Listener,
-    ) -> WorkerWithSubscribe<impl Stream<Item = ()>, F, Ctx, M> {
+    ) -> WorkerWithSubscribe<impl Stream<Item = ()> + use<Tick, F, Ctx, M>, F, Ctx, M> {
         let subscribe = listener.subscribe(self.backend.queue_name.clone());
         let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe);
 
@@ -526,11 +526,7 @@ where
         }
     }
 
-    pub fn run(self) -> impl Future<Output = ()> + Send
-    where
-        Tick: Send,
-        F::Data: Send,
-    {
+    pub async fn run(self) {
         run_worker(
             self.tick,
             self.job_handler,
@@ -538,6 +534,7 @@ where
             self.backend,
             self.concurrent,
         )
+        .await
     }
 }
 
@@ -690,7 +687,7 @@ impl Default for WorkerBuilder<Ticker, ()> {
 impl WorkerBuilder<Ticker, ()> {
     /// Create a new builder with default configuration.
     pub fn new() -> Self {
-        let ticker = Ticker::new(std::time::Duration::from_secs(1));
+        let ticker = Ticker::new(std::time::Duration::from_secs(5));
         WorkerBuilder {
             tick: ticker,
             context: (),
