@@ -56,7 +56,7 @@ pub enum ErrorKind {
 }
 
 #[derive(Debug)]
-struct Error {
+pub struct Error {
     #[allow(unused)]
     kind: ErrorKind,
     inner: Box<dyn std::error::Error + Send + 'static>,
@@ -104,10 +104,10 @@ pub struct ChannelData {
 }
 
 impl Listener {
-    const CHANNEL_NAME: &str = "tasuki_jobs";
-    async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
+    pub(crate) const CHANNEL_NAME: &str = "tasuki_jobs";
+    pub async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
         let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
-        listener.listen("tasuki_jobs").await?;
+        listener.listen(Self::CHANNEL_NAME).await?;
 
         Ok(Self {
             inner: listener,
@@ -115,7 +115,7 @@ impl Listener {
         })
     }
 
-    async fn listen(self) -> Result<(), Error> {
+    pub async fn listen(self) -> Result<(), Error> {
         let mut stream = self.inner.into_stream();
         let mut publisers = self.publishers;
 
@@ -129,7 +129,7 @@ impl Listener {
                     };
 
                     if let Some(publisher) = publisers.get_mut(&data.q) {
-                        let queue_name =publisher.name.as_ref();
+                        let queue_name = publisher.name.as_ref();
                         let _ = publisher.sender.send(()).await.inspect_err(|error|tracing::error!(error = %error, queue_name = queue_name, "Cannot send job notify"));
                     }
                 }
@@ -155,7 +155,6 @@ impl Listener {
         self.publishers
             .insert(publisher.name.to_string(), publisher);
 
-        
         Subscribe { receiver: rx }
     }
 }

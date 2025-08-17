@@ -69,3 +69,6 @@ INSERT INTO
   (max_attempts, job_data, queue_name)
 VALUES
   ($1, $2, $3);
+
+-- name: AddJobNotify :exec
+SELECT pg_notify(sqlc.arg(channel_name)::TEXT, json_build_obejct('q', sqlc.arg(queue_name)::TEXT)::TEXT);
