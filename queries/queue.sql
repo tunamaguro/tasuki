@@ -2,7 +2,7 @@
 UPDATE 
   tasuki_job j
 SET
-  status = 'running',
+  status = 'running'::tasuki_job_status,
   attempts = j.attempts + 1,
   lease_expires_at = clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL
 WHERE 
@@ -18,7 +18,7 @@ WHERE
         (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
       )
       AND 
-      (scheduled_at <= NOW() AND attempts <= max_attempts AND queue_name = sqlc.arg(queue_name)::TEXT)
+      (scheduled_at <= NOW() AND attempts < max_attempts AND queue_name = sqlc.arg(queue_name)::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT sqlc.arg(batch_size)
@@ -37,7 +37,8 @@ WHERE
 UPDATE 
   tasuki_job j
 SET 
-  status = 'completed'
+  status = 'completed'::tasuki_job_status,
+  lease_expires_at = NULL
 WHERE
   id = $1;
 
@@ -45,7 +46,8 @@ WHERE
 UPDATE
   tasuki_job j
 SET
-  status = 'canceled'
+  status = 'canceled'::tasuki_job_status,
+  lease_expires_at = NULL
 WHERE
   id = $1;
 
@@ -53,13 +55,18 @@ WHERE
 UPDATE tasuki_job j
 SET 
   status = CASE 
-            WHEN j.attempts <= j.max_attempts THEN 'pending'
-            ELSE 'failed'
+            WHEN j.attempts < j.max_attempts THEN 'pending'::tasuki_job_status
+            ELSE 'failed'::tasuki_job_status
            END,
   scheduled_at = CASE
-                  WHEN j.attempts <= j.max_attempts THEN clock_timestamp() + sqlc.arg(interval)::INTERVAL
+                  WHEN j.attempts < j.max_attempts 
+                    THEN clock_timestamp() + coalesce(
+                      sqlc.narg(interval),
+                      make_interval(secs := power(j.attempts, 4.0) * (0.9 + random() * 0.2))
+                      )::INTERVAL
                   ELSE scheduled_at
-                 END 
+                 END,
+  lease_expires_at = NULL
 WHERE 
   id = $1;
 

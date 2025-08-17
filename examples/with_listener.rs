@@ -18,6 +18,7 @@ async fn main() {
     let mut listener = backend.listener().await.unwrap();
 
     let worker = WorkerBuilder::new()
+        .tick(futures::stream::pending())
         .build(backend, job_handler)
         .subscribe(&mut listener)
         .with_graceful_shutdown(token.clone().cancelled_owned());
@@ -76,7 +77,7 @@ async fn job_handler(
         tracing::info!("--end: job {}", count)
     });
     match handle.await {
-        Ok(_) => JobResult::Cancel,
+        Ok(_) => JobResult::Complete,
         Err(_) => JobResult::Retry(None),
     }
 }
