@@ -356,15 +356,17 @@ impl OutTxContext {
     }
 
     async fn retry(&self, retry_after: Option<std::time::Duration>) -> Result<(), Error> {
-        let duration = retry_after.unwrap_or(std::time::Duration::from_secs(15));
-        let interval =
-            sqlx::postgres::types::PgInterval::try_from(duration).map_err(|e| Error {
-                kind: ErrorKind::DataBase,
-                inner: e,
-            })?;
+        let interval = retry_after
+            .map(|duration| {
+                sqlx::postgres::types::PgInterval::try_from(duration).map_err(|e| Error {
+                    kind: ErrorKind::DataBase,
+                    inner: e,
+                })
+            })
+            .transpose()?;
         queries::RetryJob::builder()
             .id(self.id)
-            .interval(&interval)
+            .interval(interval.as_ref())
             .build()
             .execute(&self.pool)
             .await?;

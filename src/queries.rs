@@ -93,7 +93,7 @@ impl<'a> GetAvailableJobs<'a> {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET
-  status = 'running',
+  status = 'running'::tasuki_job_status,
   attempts = j.attempts + 1,
   lease_expires_at = clock_timestamp() + $1::INTERVAL
 WHERE 
@@ -301,7 +301,8 @@ impl CompleteJob {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET 
-  status = 'completed'
+  status = 'completed'::tasuki_job_status,
+  lease_expires_at = NULL
 WHERE
   id = $1";
     pub fn query_as<'a>(
@@ -369,7 +370,8 @@ impl CancelJob {
     pub const QUERY: &'static str = r"UPDATE
   tasuki_job j
 SET
-  status = 'canceled'
+  status = 'canceled'::tasuki_job_status,
+  lease_expires_at = NULL
 WHERE
   id = $1";
     pub fn query_as<'a>(
@@ -432,19 +434,24 @@ impl<'a> CancelJobBuilder<'a, (sqlx::types::Uuid,)> {
 pub struct RetryJobRow {}
 pub struct RetryJob<'a> {
     id: sqlx::types::Uuid,
-    interval: &'a sqlx::postgres::types::PgInterval,
+    interval: Option<&'a sqlx::postgres::types::PgInterval>,
 }
 impl<'a> RetryJob<'a> {
     pub const QUERY: &'static str = r"UPDATE tasuki_job j
 SET 
   status = CASE 
-            WHEN j.attempts <= j.max_attempts THEN 'pending'
-            ELSE 'failed'
+            WHEN j.attempts <= j.max_attempts THEN 'pending'::tasuki_job_status
+            ELSE 'failed'::tasuki_job_status
            END,
   scheduled_at = CASE
-                  WHEN j.attempts <= j.max_attempts THEN clock_timestamp() + $2::INTERVAL
+                  WHEN j.attempts <= j.max_attempts 
+                    THEN clock_timestamp() + coalesce(
+                      $2,
+                      make_interval(secs := power(2.0, j.attempts) * (0.9 + random() * 0.2))
+                      )::INTERVAL
                   ELSE scheduled_at
-                 END 
+                 END,
+  lease_expires_at = NULL
 WHERE 
   id = $1";
     pub fn query_as(
@@ -503,8 +510,8 @@ impl<'a, Interval> RetryJobBuilder<'a, ((), Interval)> {
 impl<'a, Id> RetryJobBuilder<'a, (Id, ())> {
     pub fn interval(
         self,
-        interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> RetryJobBuilder<'a, (Id, &'a sqlx::postgres::types::PgInterval)> {
+        interval: Option<&'a sqlx::postgres::types::PgInterval>,
+    ) -> RetryJobBuilder<'a, (Id, Option<&'a sqlx::postgres::types::PgInterval>)> {
         let (id, ()) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -513,7 +520,15 @@ impl<'a, Id> RetryJobBuilder<'a, (Id, ())> {
         }
     }
 }
-impl<'a> RetryJobBuilder<'a, (sqlx::types::Uuid, &'a sqlx::postgres::types::PgInterval)> {
+impl<'a>
+    RetryJobBuilder<
+        'a,
+        (
+            sqlx::types::Uuid,
+            Option<&'a sqlx::postgres::types::PgInterval>,
+        ),
+    >
+{
     pub const fn build(self) -> RetryJob<'a> {
         let (id, interval) = self.fields;
         RetryJob { id, interval }
