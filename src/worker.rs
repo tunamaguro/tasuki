@@ -205,11 +205,6 @@ pub struct Listener {
     publishers: std::collections::HashMap<String, Publisher>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ChannelData {
-    q: String,
-}
-
 impl Listener {
     pub(crate) const CHANNEL_NAME: &str = "tasuki_jobs";
     async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
@@ -235,6 +230,11 @@ impl Listener {
         let mut publisers = self.publishers;
         let signal = signal.fuse();
         futures::pin_mut!(signal);
+
+        #[derive(Debug, Deserialize)]
+        struct ChannelData {
+            q: String,
+        }
 
         loop {
             futures::select! {
@@ -295,7 +295,7 @@ struct Publisher {
 
 pin_project! {
     #[derive(Debug)]
-    pub struct Subscribe {
+    struct Subscribe {
         #[pin]
         receiver: futures::channel::mpsc::Receiver<()>,
     }
