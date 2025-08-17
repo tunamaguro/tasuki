@@ -18,6 +18,7 @@ async fn main() {
     let mut listener = backend.listener().await.unwrap();
 
     let worker = WorkerBuilder::new()
+        .tick(futures::stream::pending())
         .build(backend, job_handler)
         .subscribe(&mut listener)
         .with_graceful_shutdown(token.clone().cancelled_owned());
