@@ -105,7 +105,7 @@ pub struct ChannelData {
 
 impl Listener {
     pub(crate) const CHANNEL_NAME: &str = "tasuki_jobs";
-    pub async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
+    async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
         let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
         listener.listen(Self::CHANNEL_NAME).await?;
 
@@ -280,6 +280,10 @@ impl BackEnd {
         }
     }
 
+    pub async fn listener(&self) -> Result<Listener, sqlx::Error> {
+        Listener::new(self.pool.clone()).await
+    }
+
     async fn get_job<T>(&self, batch_size: u16) -> Vec<Result<Job<T>, Error>>
     where
         T: DeserializeOwned,
@@ -434,7 +438,7 @@ pub struct Worker<Tick, F, Ctx, M> {
 
 impl<Tick, F, Ctx, M> Worker<Tick, F, Ctx, M>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
     F::Data: DeserializeOwned + 'static,
     Ctx: Clone,
@@ -442,7 +446,7 @@ where
     pub fn with_graceful_shutdown<Signal>(
         self,
         signal: Signal,
-    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
+    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
     where
         Signal: Future,
     {
@@ -457,7 +461,10 @@ where
         }
     }
 
-    pub fn subscribe(self, listener: &mut Listener) -> WorkerWithSubscribe<impl Stream, F, Ctx, M> {
+    pub fn subscribe(
+        self,
+        listener: &mut Listener,
+    ) -> WorkerWithSubscribe<impl Stream<Item = ()>, F, Ctx, M> {
         let subscribe = listener.subscribe(self.backend.queue_name.clone());
         let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe);
 
@@ -496,15 +503,15 @@ pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
 
 impl<Tick, F, Ctx, M> WorkerWithSubscribe<Tick, F, Ctx, M>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
     F::Data: DeserializeOwned + 'static,
-    Ctx: Clone,
+    Ctx: Clone + Send,
 {
     pub fn with_graceful_shutdown<Signal>(
         self,
         signal: Signal,
-    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
+    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
     where
         Signal: Future,
     {
@@ -519,7 +526,11 @@ where
         }
     }
 
-    pub async fn run(self) {
+    pub fn run(self) -> impl Future<Output = ()> + Send
+    where
+        Tick: Send,
+        F::Data: Send,
+    {
         run_worker(
             self.tick,
             self.job_handler,
@@ -527,7 +538,6 @@ where
             self.backend,
             self.concurrent,
         )
-        .await
     }
 }
 
@@ -543,9 +553,9 @@ pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
 
 impl<Tick, F, Ctx, M, Signal> WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned + 'static,
+    F::Data: DeserializeOwned + Send + 'static,
     Ctx: Clone,
     Signal: Future,
 {
@@ -569,7 +579,7 @@ async fn run_worker<Tick, F, M, Ctx>(
     backend: BackEnd,
     concurrent: usize,
 ) where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
     F::Data: DeserializeOwned,
     Ctx: Clone,
@@ -693,7 +703,7 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
     /// Replace the ticker driving the polling loop.
     pub fn tick<Tick2>(self, tick: Tick2) -> WorkerBuilder<Tick2, Ctx>
     where
-        Tick2: Stream,
+        Tick2: Stream<Item = ()>,
     {
         WorkerBuilder {
             tick,
@@ -733,7 +743,7 @@ impl<Ctx> WorkerBuilder<Ticker, Ctx> {
 
 impl<Tick, Ctx> WorkerBuilder<Tick, Ctx>
 where
-    Tick: Stream,
+    Tick: Stream<Item = ()>,
     Ctx: Clone,
 {
     pub fn build<F, M>(self, backend: BackEnd, f: F) -> Worker<Tick, F, Ctx, M>
