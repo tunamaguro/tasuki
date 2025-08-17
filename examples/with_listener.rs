@@ -53,7 +53,11 @@ async fn main() {
     tasks.spawn(client_handle);
     tasks.spawn(worker_fut);
     // Stop the listener when the cancellation token is triggered (e.g., Ctrl+C)
-    tasks.spawn(listener.listen_until(token.clone().cancelled_owned()).map(|_| ()));
+    tasks.spawn(
+        listener
+            .listen_until(token.clone().cancelled_owned())
+            .map(|_| ()),
+    );
     tasks.spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         token.cancel();

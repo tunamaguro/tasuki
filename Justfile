@@ -28,3 +28,7 @@ lint-ci:
 # Run tests
 test:
     cargo test --workspace
+
+# Generate by sqlc
+generate:
+    sqlc generate -f sqlc.json
