@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS  tasuki_job (
     lease_expires_at TIMESTAMPTZ,
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL,
+    lease_token UUID,
     
     job_data jsonb NOT NULL,
     

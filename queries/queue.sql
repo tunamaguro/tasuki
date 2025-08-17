@@ -4,7 +4,8 @@ UPDATE
 SET
   status = 'running'::tasuki_job_status,
   attempts = j.attempts + 1,
-  lease_expires_at = clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL
+  lease_expires_at = clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL,
+  lease_token = gen_random_uuid()
 WHERE 
   id in (
     SELECT 
@@ -23,7 +24,7 @@ WHERE
     FOR UPDATE SKIP LOCKED
     LIMIT sqlc.arg(batch_size)
   )
-RETURNING j.id, j.job_data;
+RETURNING j.id, j.job_data, j.lease_token;
 
 -- name: HeartBeatJob :exec
 UPDATE 
@@ -31,7 +32,8 @@ UPDATE
 SET
   lease_expires_at = clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL
 WHERE
-  id = $1;
+  id = sqlc.arg(id)
+  AND lease_token = sqlc.arg(lease_token);
 
 -- name: CompleteJob :exec
 UPDATE 
@@ -40,7 +42,8 @@ SET
   status = 'completed'::tasuki_job_status,
   lease_expires_at = NULL
 WHERE
-  id = $1;
+  id = sqlc.arg(id)
+  AND lease_token = sqlc.arg(lease_token);
 
 -- name: CancelJob :exec
 UPDATE
@@ -49,7 +52,8 @@ SET
   status = 'canceled'::tasuki_job_status,
   lease_expires_at = NULL
 WHERE
-  id = $1;
+  id = sqlc.arg(id)
+  AND lease_token = sqlc.arg(lease_token);
 
 -- name: RetryJob :exec
 UPDATE tasuki_job j
@@ -68,7 +72,8 @@ SET
                  END,
   lease_expires_at = NULL
 WHERE 
-  id = $1;
+  id = sqlc.arg(id)
+  AND lease_token = sqlc.arg(lease_token);
 
 -- name: InsertJobOne :exec
 INSERT INTO

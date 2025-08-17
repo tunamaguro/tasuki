@@ -160,6 +160,8 @@ pub enum ErrorKind {
     DataBase,
     /// Errors that happen while decoding job payloads.
     Decode,
+    /// The worker lost its lease/ownership (token mismatch or 0 rows affected).
+    LostLease,
 }
 
 #[derive(Debug)]
@@ -198,6 +200,28 @@ impl std::error::Error for Error {
         Some(self.inner.as_ref())
     }
 }
+
+#[derive(Debug)]
+struct LostLeaseError;
+
+impl std::fmt::Display for LostLeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("lost lease for job")
+    }
+}
+
+impl std::error::Error for LostLeaseError {}
+
+#[derive(Debug)]
+struct MsgError(&'static str);
+
+impl std::fmt::Display for MsgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MsgError {}
 
 #[derive(Debug)]
 pub struct Listener {
@@ -324,34 +348,59 @@ static LEASE_INTERVAL: std::sync::LazyLock<sqlx::postgres::types::PgInterval> =
 struct OutTxContext {
     id: sqlx::types::Uuid,
     pool: sqlx::PgPool,
+    lease_token: sqlx::types::Uuid,
 }
 
 impl OutTxContext {
     async fn heartbeat(&self) -> Result<(), Error> {
-        queries::HeartBeatJob::builder()
-            .id(self.id)
+        let res = queries::HeartBeatJob::builder()
             .lease_interval(&LEASE_INTERVAL)
+            .id(self.id)
+            .lease_token(Some(self.lease_token))
             .build()
             .execute(&self.pool)
             .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(Error {
+                kind: ErrorKind::LostLease,
+                inner: Box::new(LostLeaseError),
+            });
+        }
         Ok(())
     }
 
     async fn complete(&self) -> Result<(), Error> {
-        queries::CompleteJob::builder()
+        let res = queries::CompleteJob::builder()
             .id(self.id)
+            .lease_token(Some(self.lease_token))
             .build()
             .execute(&self.pool)
             .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(Error {
+                kind: ErrorKind::LostLease,
+                inner: Box::new(LostLeaseError),
+            });
+        }
         Ok(())
     }
 
     async fn cancel(&self) -> Result<(), Error> {
-        queries::CancelJob::builder()
+        let res = queries::CancelJob::builder()
             .id(self.id)
+            .lease_token(Some(self.lease_token))
             .build()
             .execute(&self.pool)
             .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(Error {
+                kind: ErrorKind::LostLease,
+                inner: Box::new(LostLeaseError),
+            });
+        }
         Ok(())
     }
 
@@ -364,13 +413,20 @@ impl OutTxContext {
                 })
             })
             .transpose()?;
-        queries::RetryJob::builder()
-            .id(self.id)
+        let res = queries::RetryJob::builder()
             .interval(interval.as_ref())
+            .id(self.id)
+            .lease_token(Some(self.lease_token))
             .build()
             .execute(&self.pool)
             .await?;
 
+        if res.rows_affected() == 0 {
+            return Err(Error {
+                kind: ErrorKind::LostLease,
+                inner: Box::new(LostLeaseError),
+            });
+        }
         Ok(())
     }
 }
@@ -419,9 +475,9 @@ impl BackEnd {
         T: DeserializeOwned,
     {
         let builder = queries::GetAvailableJobs::builder()
-            .batch_size(batch_size.into())
             .lease_interval(&LEASE_INTERVAL)
             .queue_name(&self.queue_name)
+            .batch_size(i32::from(batch_size))
             .build();
 
         builder
@@ -430,9 +486,16 @@ impl BackEnd {
             .map(|res| match res {
                 Ok(row) => {
                     let data = serde_json::from_value::<T>(row.job_data)?;
+                    let Some(lease_token) = row.lease_token else {
+                        return Err(Error {
+                            kind: ErrorKind::DataBase,
+                            inner: Box::new(MsgError("lease_token is NULL")),
+                        });
+                    };
                     let context = OutTxContext {
                         id: row.id,
                         pool: self.pool.clone(),
+                        lease_token,
                     };
                     Ok(Job { context, data })
                 }
