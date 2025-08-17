@@ -5,9 +5,9 @@
 //! [`BackEnd`] at a fixed interval and drives job handlers to completion
 //! while periodically sending heartbeats to maintain job leases.
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
 use pin_project_lite::pin_project;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::queries;
 
@@ -89,6 +89,103 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.inner.as_ref())
+    }
+}
+
+#[derive(Debug)]
+pub struct Listener {
+    inner: sqlx::postgres::PgListener,
+    publishers: std::collections::HashMap<String, Publisher>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChannelData {
+    q: String,
+}
+
+impl Listener {
+    const CHANNEL_NAME: &str = "tasuki_jobs";
+    async fn new(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+        listener.listen("tasuki_jobs").await?;
+
+        Ok(Self {
+            inner: listener,
+            publishers: Default::default(),
+        })
+    }
+
+    async fn listen(self) -> Result<(), Error> {
+        let mut stream = self.inner.into_stream();
+        let mut publisers = self.publishers;
+
+        loop {
+            match stream.try_next().await {
+                Ok(Some(notification)) => {
+                    let payload = notification.payload();
+                    let data = serde_json::from_str::<ChannelData>(payload).inspect_err(|error|tracing::error!(error = %error,"Cannot deserialize job notify message"));
+                    let Ok(data) = data else {
+                        continue;
+                    };
+
+                    if let Some(publisher) = publisers.get_mut(&data.q) {
+                        let queue_name =publisher.name.as_ref();
+                        let _ = publisher.sender.send(()).await.inspect_err(|error|tracing::error!(error = %error, queue_name = queue_name, "Cannot send job notify"));
+                    }
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "Error happen when receive message from channel");
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    fn subscribe(&mut self, queue_name: impl Into<std::borrow::Cow<'static, str>>) -> Subscribe {
+        let queue_name = queue_name.into();
+        let (tx, rx) = futures::channel::mpsc::channel(32);
+        let publisher = Publisher {
+            name: queue_name,
+            sender: tx,
+        };
+        self.publishers
+            .insert(publisher.name.to_string(), publisher);
+
+        
+        Subscribe { receiver: rx }
+    }
+}
+
+#[derive(Debug)]
+struct Publisher {
+    sender: futures::channel::mpsc::Sender<()>,
+    name: std::borrow::Cow<'static, str>,
+}
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct Subscribe {
+        #[pin]
+        receiver: futures::channel::mpsc::Receiver<()>,
+    }
+}
+
+impl Stream for Subscribe {
+    type Item = ();
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.receiver.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.receiver.size_hint()
     }
 }
 
@@ -332,6 +429,7 @@ pub struct Worker<Tick, F, Ctx, M> {
     concurrent: usize,
     job_handler: F,
     context: Ctx,
+    backend: BackEnd,
     _marker: std::marker::PhantomData<M>,
 }
 
@@ -354,19 +452,80 @@ where
             concurrent: self.concurrent,
             job_handler: self.job_handler,
             context: self.context,
+            backend: self.backend,
             _marker: self._marker,
             signal,
         }
     }
 
+    pub fn subscribe(self, listener: &mut Listener) -> WorkerWithSubscribe<impl Stream, F, Ctx, M> {
+        let subscribe = listener.subscribe(self.backend.queue_name.clone());
+        let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe);
+
+        WorkerWithSubscribe {
+            tick: tick_stream,
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            backend: self.backend,
+            _marker: self._marker,
+        }
+    }
+
     /// Start polling the backend and executing jobs until the stream
     /// terminates.
-    pub async fn run(self, backend: BackEnd) {
+    pub async fn run(self) {
         run_worker(
             self.tick,
             self.job_handler,
             self.context,
-            backend,
+            self.backend,
+            self.concurrent,
+        )
+        .await
+    }
+}
+
+pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
+    tick: Tick,
+    concurrent: usize,
+    job_handler: F,
+    context: Ctx,
+    backend: BackEnd,
+    _marker: std::marker::PhantomData<M>,
+}
+
+impl<Tick, F, Ctx, M> WorkerWithSubscribe<Tick, F, Ctx, M>
+where
+    Tick: Stream,
+    F: JobHandler<M, Context = Ctx>,
+    F::Data: DeserializeOwned + 'static,
+    Ctx: Clone,
+{
+    pub fn with_graceful_shutdown<Signal>(
+        self,
+        signal: Signal,
+    ) -> WorkerWithGracefulShutdown<impl Stream, F, Ctx, M, Signal>
+    where
+        Signal: Future,
+    {
+        WorkerWithGracefulShutdown {
+            tick: self.tick,
+            concurrent: self.concurrent,
+            job_handler: self.job_handler,
+            context: self.context,
+            backend: self.backend,
+            _marker: self._marker,
+            signal,
+        }
+    }
+
+    pub async fn run(self) {
+        run_worker(
+            self.tick,
+            self.job_handler,
+            self.context,
+            self.backend,
             self.concurrent,
         )
         .await
@@ -378,6 +537,7 @@ pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
     concurrent: usize,
     job_handler: F,
     context: Ctx,
+    backend: BackEnd,
     _marker: std::marker::PhantomData<M>,
     signal: Signal,
 }
@@ -390,13 +550,13 @@ where
     Ctx: Clone,
     Signal: Future,
 {
-    pub async fn run(self, backend: BackEnd) {
+    pub async fn run(self) {
         let tick = self.tick.take_until(self.signal);
         run_worker(
             tick,
             self.job_handler,
             self.context,
-            backend,
+            self.backend,
             self.concurrent,
         )
         .await
@@ -466,7 +626,7 @@ async fn run_worker<Tick, F, M, Ctx>(
 
     let tick = tick.fuse();
     futures::pin_mut!(tick);
-    let mut tasks: futures::stream::FuturesUnordered<_> = futures::stream::FuturesUnordered::new();
+    let mut tasks = futures::stream::FuturesUnordered::new();
     let mut in_flight: usize = 0;
 
     loop {
@@ -577,7 +737,7 @@ where
     Tick: Stream,
     Ctx: Clone,
 {
-    pub fn build<F, M>(self, f: F) -> Worker<Tick, F, Ctx, M>
+    pub fn build<F, M>(self, backend: BackEnd, f: F) -> Worker<Tick, F, Ctx, M>
     where
         F: JobHandler<M, Context = Ctx>,
     {
@@ -586,6 +746,7 @@ where
             concurrent: self.concurrent,
             job_handler: f,
             context: self.context,
+            backend,
             _marker: std::marker::PhantomData,
         }
     }

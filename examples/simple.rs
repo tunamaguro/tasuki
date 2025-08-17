@@ -12,7 +12,7 @@ async fn main() {
         .unwrap();
 
     let backend = BackEnd::new(pool.clone());
-    let worker = WorkerBuilder::new().build(job_handler);
+    let worker = WorkerBuilder::new().build(backend, job_handler);
 
     let client = Client::<u64>::new(pool.clone());
     let client_handle = async move {
@@ -33,7 +33,7 @@ async fn main() {
         }
     };
 
-    let worker_fut = worker.run(backend);
+    let worker_fut = worker.run();
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(client_handle);
     tasks.spawn(worker_fut);
