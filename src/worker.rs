@@ -46,6 +46,97 @@ impl Stream for Ticker {
     }
 }
 
+pin_project! {
+    /// Rate-limits the stream; items beyond the limit are dropped.
+    pub struct Throttle<St> {
+        #[pin]
+        inner: St,
+        #[pin]
+        ticker: Ticker,
+        max_count: usize,
+        // Number of items issued in the current window
+        issued_in_window: usize,
+    }
+}
+
+impl<St> Throttle<St> {
+    /// Create a throttling adapter over `stream`.
+    ///
+    /// - `duration`: length of each rate-limiting window.
+    /// - `max_count`: maximum number of items to forward per window.
+    fn new(stream: St, duration: std::time::Duration, max_count: usize) -> Self {
+        Self {
+            inner: stream,
+            ticker: Ticker::new(duration),
+            max_count,
+            issued_in_window: 0,
+        }
+    }
+}
+
+trait ThrottleExt: Stream {
+    /// Forward at most `max_count` items per `duration`; drop excess.
+    ///
+    /// ## Note
+    /// No buffering is performed.
+    fn throttle(self, duration: std::time::Duration, max_count: usize) -> Throttle<Self>
+    where
+        Self: Sized,
+    {
+        Throttle::new(self, duration, max_count)
+    }
+}
+
+impl<St> Stream for Throttle<St>
+where
+    St: Stream,
+{
+    type Item = St::Item;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        // Waker semantics: when throttled, we return Pending after polling the
+        // ticker, so the task is woken by the next tick. When not throttled, we
+        // poll the inner stream and forward readiness.
+
+        // First, poll the ticker to see if a new window started.
+        // If it ticked, reset the counter so a fresh burst is allowed.
+        match this.ticker.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(())) => {
+                *this.issued_in_window = 0;
+            }
+            std::task::Poll::Ready(None) => {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending => {}
+        }
+
+        // Otherwise forward to inner stream and count one if we yield an item.
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                if *this.issued_in_window >= *this.max_count {
+                    return std::task::Poll::Pending;
+                }
+
+                *this.issued_in_window += 1;
+                std::task::Poll::Ready(Some(item))
+            }
+            other => other,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Delegates size hints; throttle can only reduce throughput.
+        self.inner.size_hint()
+    }
+}
+
+// Allow any Stream to call `.throttle(...)`.
+impl<St> ThrottleExt for St where St: Stream {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Categorization of failures that may occur while processing jobs.
 pub enum ErrorKind {
@@ -115,34 +206,55 @@ impl Listener {
         })
     }
 
-    pub async fn listen(self) -> Result<(), Error> {
-        let mut stream = self.inner.into_stream();
+    /// Listen for notifications until the provided `signal` completes.
+    ///
+    /// This is a graceful variant of [`listen`]; it exits when either
+    /// the database notification stream ends, an error occurs, or the
+    /// `signal` resolves (e.g., on shutdown).
+    pub async fn listen_until<Signal>(self, signal: Signal) -> Result<(), Error>
+    where
+        Signal: std::future::Future,
+    {
+        let mut stream = self.inner.into_stream().fuse();
         let mut publisers = self.publishers;
+        let signal = signal.fuse();
+        futures::pin_mut!(signal);
 
         loop {
-            match stream.try_next().await {
-                Ok(Some(notification)) => {
-                    let payload = notification.payload();
-                    let data = serde_json::from_str::<ChannelData>(payload).inspect_err(|error|tracing::error!(error = %error,"Cannot deserialize job notify message"));
-                    let Ok(data) = data else {
-                        continue;
-                    };
-
-                    if let Some(publisher) = publisers.get_mut(&data.q) {
-                        let queue_name = publisher.name.as_ref();
-                        let _ = publisher.sender.send(()).await.inspect_err(|error|tracing::error!(error = %error, queue_name = queue_name, "Cannot send job notify"));
-                    }
-                }
-                Ok(None) => {
+            futures::select! {
+                _ = &mut signal => {
                     break;
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "Error happen when receive message from channel");
+                msg = stream.try_next() => {
+                    match msg {
+                        Ok(Some(notification)) => {
+                            let payload = notification.payload();
+                            let data = serde_json::from_str::<ChannelData>(payload).inspect_err(|error|tracing::error!(error = %error,"Cannot deserialize job notify message"));
+                            let Ok(data) = data else {
+                                continue;
+                            };
+
+                            if let Some(publisher) = publisers.get_mut(&data.q) {
+                                let queue_name = publisher.name.as_ref();
+                                let _ = publisher.sender.send(()).await.inspect_err(|error|tracing::error!(error = %error, queue_name = queue_name, "Cannot send job notify"));
+                            }
+                        }
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "Error happen when receive message from channel");
+                        }
+                    }
                 }
-            };
+            }
         }
 
         Ok(())
+    }
+
+    pub async fn listen(self) -> Result<(), Error> {
+        self.listen_until(std::future::pending::<()>()).await
     }
 
     fn subscribe(&mut self, queue_name: impl Into<std::borrow::Cow<'static, str>>) -> Subscribe {
@@ -461,12 +573,20 @@ where
         }
     }
 
+    /// Combine periodic ticks with DB LISTEN notifications and apply a
+    /// small throttle to coalesce bursts.
+    ///
+    /// Notes
+    /// - The resulting stream is throttled to at most 1 event every
+    ///   100ms. This protects the database from hot loops when many
+    ///   notifications arrive at once and reduces redundant fetches.
     pub fn subscribe(
         self,
         listener: &mut Listener,
     ) -> WorkerWithSubscribe<impl Stream<Item = ()> + use<Tick, F, Ctx, M>, F, Ctx, M> {
         let subscribe = listener.subscribe(self.backend.queue_name.clone());
-        let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe);
+        let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe)
+            .throttle(std::time::Duration::from_millis(100), 1);
 
         WorkerWithSubscribe {
             tick: tick_stream,
@@ -493,7 +613,13 @@ where
 }
 
 pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
-    tick: Tick,
+    /// Tick stream that is already throttled.
+    ///
+    /// This worker variant applies a built-in throttle of 1 event per 100ms
+    /// to the combined tick/subscribe stream created by [`Worker::subscribe`].
+    /// This is intentional to limit fetch frequency during notification
+    /// bursts and prevent tight polling loops.
+    tick: Throttle<Tick>,
     concurrent: usize,
     job_handler: F,
     context: Ctx,
