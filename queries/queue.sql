@@ -55,7 +55,7 @@ WHERE
 UPDATE tasuki_job j
 SET 
   status = CASE 
-            WHEN j.attempts <= j.max_attempts THEN 'pending'::tasuki_job_status
+            WHEN j.attempts < j.max_attempts THEN 'pending'::tasuki_job_status
             ELSE 'failed'::tasuki_job_status
            END,
   scheduled_at = CASE
