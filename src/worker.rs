@@ -212,6 +212,7 @@ impl BackEnd {
             .await
     }
 
+    #[allow(dead_code)]
     fn into_datastream<S, T>(
         self,
         tick: S,
@@ -414,45 +415,91 @@ async fn run_worker<Tick, F, M, Ctx>(
     F::Data: DeserializeOwned,
     Ctx: Clone,
 {
-    let data_stream = backend.into_datastream(tick, 8);
+    // Helper to run a single job with heartbeat and finalization
+    async fn run_one_job<F, M, Ctx>(job: Job<F::Data>, handler: F, worker_context: Ctx) -> ()
+    where
+        F: JobHandler<M, Context = Ctx>,
+        Ctx: Clone,
+    {
+        let Job {
+            context: job_context,
+            data,
+        } = job;
+        tracing::trace!("Start handler");
+        let result = {
+            let hb_every = LEASE_DURATION / 3;
+            let mut ticker = Ticker::new(hb_every).fuse();
 
-    let filtered = data_stream.filter_map(|result| async {
-        result
-            .inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
-            .ok()
-    });
+            let mut handler_fut = handler
+                .clone()
+                .call(data, worker_context.clone())
+                .boxed()
+                .fuse();
+            loop {
+                futures::select! {
+                    res = handler_fut => break res,
+                    _ = ticker.next() =>{
+                        let _res = job_context.heartbeat().await.inspect_err(
+                            |error| tracing::error!(error = %error, job_id = %job_context.id, "Failed to heartbeat job"),
+                        );
+                    }
+                }
+            }
+        };
+        tracing::trace!("Finish handler");
 
-    let runner = filtered.map(|job| async {
-            let Job { context:job_context, data } = job;
-            tracing::trace!("Start handler");
-            let result = {
-                let hb_every = LEASE_DURATION / 3;
-                let mut ticker = Ticker::new(hb_every).fuse();
+        let _ = match result {
+            JobResult::Complete => job_context
+                .complete()
+                .await
+                .inspect_err(|error| tracing::error!(error = %error, "Failed to complete job")),
+            JobResult::Retry(duration) => job_context
+                .retry(duration)
+                .await
+                .inspect_err(|error| tracing::error!(error = %error, "Failed to retry job")),
+            JobResult::Cancel => job_context
+                .cancel()
+                .await
+                .inspect_err(|error| tracing::error!(error = %error, "Failed to cancel job")),
+        };
+    }
 
-                let mut handler_fut = handler.clone().call(data, worker_context.clone()).boxed().fuse();
-                loop {
-                    futures::select! {
-                        res = handler_fut => break res,
-                        _ = ticker.next() =>{
-                            let _res = job_context.heartbeat().await.inspect_err(
-                                |error| tracing::error!(error = %error, job_id = %job_context.id, "Failed to heartbeat job"),
-                            );
+    let tick = tick.fuse();
+    futures::pin_mut!(tick);
+    let mut tasks: futures::stream::FuturesUnordered<_> = futures::stream::FuturesUnordered::new();
+    let mut in_flight: usize = 0;
+
+    loop {
+        futures::select! {
+            tick_val = tick.next() => {
+                // If tick stream ended (e.g., graceful shutdown), stop fetching
+                if tick_val.is_none() { break; }
+
+                let free = concurrent.saturating_sub(in_flight) as u16;
+                if free > 0 {
+                    let results = backend.get_job::<F::Data>(free).await;
+                    for res in results {
+                        match res {
+                            Ok(job) => {
+                                in_flight += 1;
+                                let fut = run_one_job::<F, M, Ctx>(job, handler.clone(), worker_context.clone());
+                                tasks.push(fut);
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "Failed to fetch job");
+                            }
                         }
                     }
                 }
-            };
-            tracing::trace!("Finish handler");
+            },
+            _ = tasks.next() => {
+                in_flight = in_flight.saturating_sub(1);
+            },
+        }
+    }
 
-            let _ =match result {
-                JobResult::Complete => {job_context.complete().await.inspect_err(   |error| tracing::error!(error = %error, "Failed to complete job"))},
-                JobResult::Retry(duration) =>  {job_context.retry(duration).await.inspect_err(|error| tracing::error!(error = %error, "Failed to retry job"))},
-                JobResult::Cancel => {job_context.cancel().await.inspect_err(|error|tracing::error!(error = %error, "Failed to cancel job"))},
-            };
-        });
-
-    let fut = runner.buffer_unordered(concurrent).for_each(|_| async {});
-
-    fut.await
+    // Drain remaining tasks
+    while tasks.next().await.is_some() {}
 }
 
 /// Builder for configuring and constructing [`Worker`] instances.
