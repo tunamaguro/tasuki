@@ -416,22 +416,25 @@ async fn run_worker<Tick, F, M, Ctx>(
     Ctx: Clone,
 {
     // Helper to run a single job with heartbeat and finalization
-    async fn run_one_job<F, M, Ctx, T>(
-        job: Job<T>,
-        handler: F,
-        worker_context: Ctx,
-    ) -> ()
+    async fn run_one_job<F, M, Ctx>(job: Job<F::Data>, handler: F, worker_context: Ctx) -> ()
     where
-        F: JobHandler<M, Context = Ctx> + Clone,
+        F: JobHandler<M, Context = Ctx>,
         Ctx: Clone,
     {
-        let Job { context: job_context, data } = job;
+        let Job {
+            context: job_context,
+            data,
+        } = job;
         tracing::trace!("Start handler");
         let result = {
             let hb_every = LEASE_DURATION / 3;
             let mut ticker = Ticker::new(hb_every).fuse();
 
-            let mut handler_fut = handler.clone().call(data, worker_context.clone()).boxed().fuse();
+            let mut handler_fut = handler
+                .clone()
+                .call(data, worker_context.clone())
+                .boxed()
+                .fuse();
             loop {
                 futures::select! {
                     res = handler_fut => break res,
@@ -461,7 +464,8 @@ async fn run_worker<Tick, F, M, Ctx>(
         };
     }
 
-    let mut tick = tick.fuse();
+    let tick = tick.fuse();
+    futures::pin_mut!(tick);
     let mut tasks: futures::stream::FuturesUnordered<_> = futures::stream::FuturesUnordered::new();
     let mut in_flight: usize = 0;
 
@@ -478,7 +482,7 @@ async fn run_worker<Tick, F, M, Ctx>(
                         match res {
                             Ok(job) => {
                                 in_flight += 1;
-                                let fut = run_one_job::<F, M, Ctx, _>(job, handler.clone(), worker_context.clone());
+                                let fut = run_one_job::<F, M, Ctx>(job, handler.clone(), worker_context.clone());
                                 tasks.push(fut);
                             }
                             Err(error) => {
@@ -488,8 +492,8 @@ async fn run_worker<Tick, F, M, Ctx>(
                     }
                 }
             },
-            _ = tasks.next(), if in_flight > 0 => {
-                if in_flight > 0 { in_flight -= 1; }
+            _ = tasks.next() => {
+                in_flight = in_flight.saturating_sub(1);
             },
         }
     }
