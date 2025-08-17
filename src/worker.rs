@@ -340,21 +340,18 @@ impl Stream for Subscribe {
     }
 }
 
-const LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
-static LEASE_INTERVAL: std::sync::LazyLock<sqlx::postgres::types::PgInterval> =
-    std::sync::LazyLock::new(|| LEASE_DURATION.try_into().unwrap());
-
 #[derive(Debug)]
 struct OutTxContext {
     id: sqlx::types::Uuid,
     pool: sqlx::PgPool,
     lease_token: sqlx::types::Uuid,
+    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
 }
 
 impl OutTxContext {
     async fn heartbeat(&self) -> Result<(), Error> {
         let res = queries::HeartBeatJob::builder()
-            .lease_interval(&LEASE_INTERVAL)
+            .lease_interval(self.lease_interval.as_ref())
             .id(self.id)
             .lease_token(Some(self.lease_token))
             .build()
@@ -470,12 +467,16 @@ impl BackEnd {
         Listener::new(self.pool.clone()).await
     }
 
-    async fn get_job<T>(&self, batch_size: u16) -> Vec<Result<Job<T>, Error>>
+    async fn get_job<T>(
+        &self,
+        batch_size: u16,
+        lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
+    ) -> Vec<Result<Job<T>, Error>>
     where
         T: DeserializeOwned,
     {
         let builder = queries::GetAvailableJobs::builder()
-            .lease_interval(&LEASE_INTERVAL)
+            .lease_interval(lease_interval.as_ref())
             .queue_name(&self.queue_name)
             .batch_size(i32::from(batch_size))
             .build();
@@ -496,6 +497,7 @@ impl BackEnd {
                         id: row.id,
                         pool: self.pool.clone(),
                         lease_token,
+                        lease_interval: lease_interval.clone(),
                     };
                     Ok(Job { context, data })
                 }
@@ -510,6 +512,7 @@ impl BackEnd {
         self,
         tick: S,
         batch_size: u16,
+        lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
     ) -> impl Stream<Item = Result<Job<T>, Error>>
     where
         S: Stream,
@@ -517,7 +520,8 @@ impl BackEnd {
     {
         tick.then(move |_| {
             let backend = self.clone();
-            async move { backend.get_job::<T>(batch_size).await }
+            let lease_interval = lease_interval.clone();
+            async move { backend.get_job::<T>(batch_size, lease_interval).await }
         })
         .flat_map(futures::stream::iter)
     }
@@ -626,6 +630,8 @@ pub struct Worker<Tick, F, Ctx, M> {
     job_handler: F,
     context: Ctx,
     backend: BackEnd,
+    heartbeat_every: std::time::Duration,
+    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
     _marker: std::marker::PhantomData<M>,
 }
 
@@ -649,6 +655,8 @@ where
             job_handler: self.job_handler,
             context: self.context,
             backend: self.backend,
+            heartbeat_every: self.heartbeat_every,
+            lease_interval: self.lease_interval,
             _marker: self._marker,
             signal,
         }
@@ -675,6 +683,8 @@ where
             job_handler: self.job_handler,
             context: self.context,
             backend: self.backend,
+            heartbeat_every: self.heartbeat_every,
+            lease_interval: self.lease_interval,
             _marker: self._marker,
         }
     }
@@ -688,6 +698,8 @@ where
             self.context,
             self.backend,
             self.concurrent,
+            self.heartbeat_every,
+            self.lease_interval,
         )
         .await
     }
@@ -705,6 +717,8 @@ pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
     job_handler: F,
     context: Ctx,
     backend: BackEnd,
+    heartbeat_every: std::time::Duration,
+    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
     _marker: std::marker::PhantomData<M>,
 }
 
@@ -728,6 +742,8 @@ where
             job_handler: self.job_handler,
             context: self.context,
             backend: self.backend,
+            heartbeat_every: self.heartbeat_every,
+            lease_interval: self.lease_interval,
             _marker: self._marker,
             signal,
         }
@@ -740,6 +756,8 @@ where
             self.context,
             self.backend,
             self.concurrent,
+            self.heartbeat_every,
+            self.lease_interval,
         )
         .await
     }
@@ -751,6 +769,8 @@ pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
     job_handler: F,
     context: Ctx,
     backend: BackEnd,
+    heartbeat_every: std::time::Duration,
+    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
     _marker: std::marker::PhantomData<M>,
     signal: Signal,
 }
@@ -771,6 +791,8 @@ where
             self.context,
             self.backend,
             self.concurrent,
+            self.heartbeat_every,
+            self.lease_interval,
         )
         .await
     }
@@ -782,6 +804,8 @@ async fn run_worker<Tick, F, M, Ctx>(
     worker_context: Ctx,
     backend: BackEnd,
     concurrent: usize,
+    heartbeat_every: std::time::Duration,
+    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
 ) where
     Tick: Stream<Item = ()>,
     F: JobHandler<M, Context = Ctx>,
@@ -789,7 +813,12 @@ async fn run_worker<Tick, F, M, Ctx>(
     Ctx: Clone,
 {
     // Helper to run a single job with heartbeat and finalization
-    async fn run_one_job<F, M, Ctx>(job: Job<F::Data>, handler: F, worker_context: Ctx) -> ()
+    async fn run_one_job<F, M, Ctx>(
+        job: Job<F::Data>,
+        handler: F,
+        worker_context: Ctx,
+        heartbeat_every: std::time::Duration,
+    ) -> ()
     where
         F: JobHandler<M, Context = Ctx>,
         Ctx: Clone,
@@ -800,8 +829,7 @@ async fn run_worker<Tick, F, M, Ctx>(
         } = job;
         tracing::trace!("Start handler");
         let result = {
-            let hb_every = LEASE_DURATION / 3;
-            let mut ticker = Ticker::new(hb_every).fuse();
+            let mut ticker = Ticker::new(heartbeat_every).fuse();
 
             let mut handler_fut = handler
                 .clone()
@@ -850,12 +878,17 @@ async fn run_worker<Tick, F, M, Ctx>(
 
                 let free = concurrent.saturating_sub(in_flight) as u16;
                 if free > 0 {
-                    let results = backend.get_job::<F::Data>(free).await;
+                    let results = backend.get_job::<F::Data>(free, lease_interval.clone()).await;
                     for res in results {
                         match res {
                             Ok(job) => {
                                 in_flight += 1;
-                                let fut = run_one_job::<F, M, Ctx>(job, handler.clone(), worker_context.clone());
+                                let fut = run_one_job::<F, M, Ctx>(
+                                    job,
+                                    handler.clone(),
+                                    worker_context.clone(),
+                                    heartbeat_every,
+                                );
                                 tasks.push(fut);
                             }
                             Err(error) => {
@@ -883,6 +916,8 @@ pub struct WorkerBuilder<Tick = Ticker, Ctx = ()> {
     tick: Tick,
     context: Ctx,
     concurrent: usize,
+    lease_duration: std::time::Duration,
+    heartbeat_every: std::time::Duration,
 }
 
 impl Default for WorkerBuilder<Ticker, ()> {
@@ -894,11 +929,15 @@ impl Default for WorkerBuilder<Ticker, ()> {
 impl WorkerBuilder<Ticker, ()> {
     /// Create a new builder with default configuration.
     pub fn new() -> Self {
+        const LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+
         let ticker = Ticker::new(std::time::Duration::from_secs(5));
         WorkerBuilder {
             tick: ticker,
             context: (),
             concurrent: 8,
+            lease_duration: LEASE_DURATION,
+            heartbeat_every: LEASE_DURATION / 3,
         }
     }
 }
@@ -913,6 +952,8 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
             tick,
             context: self.context,
             concurrent: self.concurrent,
+            lease_duration: self.lease_duration,
+            heartbeat_every: self.heartbeat_every,
         }
     }
 
@@ -925,12 +966,30 @@ impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
             context,
             tick: self.tick,
             concurrent: self.concurrent,
+            lease_duration: self.lease_duration,
+            heartbeat_every: self.heartbeat_every,
         }
     }
 
     /// Set the maximum number of jobs processed concurrently.
     pub fn concurrent(self, concurrent: usize) -> Self {
         Self { concurrent, ..self }
+    }
+
+    /// Set the job lease duration used for claiming and extending leases.
+    pub fn lease_duration(self, lease_duration: std::time::Duration) -> Self {
+        Self {
+            lease_duration,
+            ..self
+        }
+    }
+
+    /// Set how often to send heartbeats while a job is running.
+    pub fn heartbeat_every(self, period: std::time::Duration) -> Self {
+        Self {
+            heartbeat_every: period,
+            ..self
+        }
     }
 }
 
@@ -954,12 +1013,18 @@ where
     where
         F: JobHandler<M, Context = Ctx>,
     {
+        let lease_interval = std::sync::Arc::new(
+            sqlx::postgres::types::PgInterval::try_from(self.lease_duration)
+                .expect("invalid lease duration"),
+        );
         Worker {
             tick: self.tick,
             concurrent: self.concurrent,
             job_handler: f,
             context: self.context,
             backend,
+            heartbeat_every: self.heartbeat_every,
+            lease_interval,
             _marker: std::marker::PhantomData,
         }
     }
