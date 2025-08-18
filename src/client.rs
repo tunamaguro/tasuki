@@ -148,7 +148,7 @@ where
     T: Serialize + Sync,
 {
     /// Insert a job into the queue using the client's connection pool.
-    pub async fn insert<'data>(&self, data: &'data InsertJob<T>) -> Result<(), Error> {
+    pub async fn insert(&self, data: &InsertJob<T>) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
         self.insert_tx(data, &mut tx).await?;
         tx.commit().await?;
@@ -202,7 +202,8 @@ where
 
         Ok(())
     }
-
+    
+    #[allow(clippy::manual_async_fn)]
     pub fn insert_batch_tx<'a, 'c, 'job, A, I>(
         &self,
         data: I,
