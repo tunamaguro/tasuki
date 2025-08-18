@@ -82,6 +82,13 @@ INSERT INTO
 VALUES
   ($1, $2, $3);
 
+-- name: InsertJobMany :copyfrom
+INSERT INTO
+  tasuki_job
+  (max_attempts, job_data, queue_name)
+VALUES
+  ($1, $2, $3);
+
 -- name: AddJobNotify :exec
 SELECT pg_notify(
   sqlc.arg(channel_name)::TEXT,

@@ -63,6 +63,13 @@ pub struct Error {
 }
 
 impl Error {
+    fn new_database(error: Box<dyn std::error::Error + Send + 'static>) -> Self {
+        Error {
+            kind: ErrorKind::Encode,
+            inner: error,
+        }
+    }
+
     /// Return the category of this error.
     pub fn kind(&self) -> ErrorKind {
         self.kind
@@ -71,10 +78,7 @@ impl Error {
 
 impl From<sqlx::Error> for Error {
     fn from(value: sqlx::Error) -> Self {
-        Self {
-            kind: ErrorKind::DataBase,
-            inner: Box::new(value),
-        }
+        Self::new_database(Box::new(value))
     }
 }
 
@@ -141,29 +145,12 @@ impl<T> Client<T> {
 
 impl<T> Client<T>
 where
-    T: Serialize + Send + Sync + 'static,
+    T: Serialize + Sync,
 {
     /// Insert a job into the queue using the client's connection pool.
-    pub async fn insert(&self, data: InsertJob<T>) -> Result<(), Error> {
-        let value = serde_json::to_value(data.data)?;
-
+    pub async fn insert(&self, data: &InsertJob<T>) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
-
-        queries::InsertJobOne::builder()
-            .job_data(&value)
-            .max_attempts(data.max_attempts.into())
-            .queue_name(&self.queue_name)
-            .build()
-            .execute(&mut *tx)
-            .await?;
-
-        queries::AddJobNotify::builder()
-            .channel_name(crate::worker::Listener::CHANNEL_NAME)
-            .queue_name(&self.queue_name)
-            .build()
-            .execute(&mut *tx)
-            .await?;
-
+        self.insert_tx(data, &mut tx).await?;
         tx.commit().await?;
 
         Ok(())
@@ -171,16 +158,16 @@ where
 
     /// Insert a job using an existing transaction or connection.
     #[allow(clippy::manual_async_fn)]
-    pub fn insert_tx<'a, 'c, A>(
+    pub fn insert_tx<'a, 'c, 'data, A>(
         &self,
-        data: InsertJob<T>,
+        data: &'data InsertJob<T>,
         tx: A,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + Send
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
     {
         async move {
-            let value = serde_json::to_value(data.data)?;
+            let value = serde_json::to_value(&data.data)?;
 
             let mut conn = tx.acquire().await?;
 
@@ -191,6 +178,74 @@ where
                 .build()
                 .execute(&mut *conn)
                 .await?;
+
+            queries::AddJobNotify::builder()
+                .queue_name(&self.queue_name)
+                .channel_name(crate::worker::Listener::CHANNEL_NAME)
+                .build()
+                .execute(&mut *conn)
+                .await?;
+
+            Ok(())
+        }
+    }
+
+    /// Insert multiple jobs into the queue using the client's connection pool.
+    ///
+    /// This method begins and commits its own transaction internally. For
+    /// batching within an existing transaction, use `insert_batch_tx`.
+    pub async fn insert_batch<'job, I>(&self, data: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I::IntoIter: Send,
+        T: 'job,
+    {
+        let mut tx = self.pool.begin().await?;
+        self.insert_batch_tx(data, &mut tx).await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Insert multiple jobs using an existing transaction or connection.
+    ///
+    /// - `data`: Iterator of job descriptors to enqueue.
+    /// - `tx`: A transaction/connection that implements `sqlx::Acquire`.
+    ///
+    /// Uses PostgreSQL COPY for efficient bulk insert and emits a single NOTIFY
+    /// after all rows are inserted to wake listeners.
+    #[allow(clippy::manual_async_fn)]
+    pub fn insert_batch_tx<'a, 'c, 'job, A, I>(
+        &self,
+        data: I,
+        tx: A,
+    ) -> impl Future<Output = Result<(), Error>> + Send
+    where
+        A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
+        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I::IntoIter: Send,
+        T: 'job,
+    {
+        async move {
+            let mut conn = tx.acquire().await?;
+            {
+                let mut sink = queries::InsertJobMany::copy_in_tx(&mut conn).await?;
+                for job in data {
+                    let value = serde_json::to_value(&job.data)?;
+                    queries::InsertJobMany::builder()
+                        .job_data(&value)
+                        .max_attempts(job.max_attempts.into())
+                        .queue_name(&self.queue_name)
+                        .build()
+                        .write(&mut sink)
+                        .await
+                        .map_err(|error| Error::new_database(error))?;
+                }
+
+                sink.finish()
+                    .await
+                    .map_err(|error| Error::new_database(error))?;
+            }
 
             queries::AddJobNotify::builder()
                 .queue_name(&self.queue_name)
