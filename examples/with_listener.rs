@@ -35,7 +35,7 @@ async fn main() {
                 }
                 _ = interval.tick()=>{
                     let job = InsertJob::new(n);
-                    match client.insert(job).await {
+                    match client.insert(&job).await {
                         Ok(_) => {
                             tracing::info!("Enqueue job {}", n);
                             n += 1

@@ -145,10 +145,10 @@ impl<T> Client<T> {
 
 impl<T> Client<T>
 where
-    T: Serialize + Send + Sync + 'static,
+    T: Serialize + Sync,
 {
     /// Insert a job into the queue using the client's connection pool.
-    pub async fn insert(&self, data: InsertJob<T>) -> Result<(), Error> {
+    pub async fn insert<'data>(&self, data: &'data InsertJob<T>) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
         self.insert_tx(data, &mut tx).await?;
         tx.commit().await?;
@@ -158,16 +158,16 @@ where
 
     /// Insert a job using an existing transaction or connection.
     #[allow(clippy::manual_async_fn)]
-    pub fn insert_tx<'a, 'c, A>(
+    pub fn insert_tx<'a, 'c, 'data, A>(
         &self,
-        data: InsertJob<T>,
+        data: &'data InsertJob<T>,
         tx: A,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + Send
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
     {
         async move {
-            let value = serde_json::to_value(data.data)?;
+            let value = serde_json::to_value(&data.data)?;
 
             let mut conn = tx.acquire().await?;
 
@@ -190,9 +190,11 @@ where
         }
     }
 
-    pub async fn insert_batch<I>(&self, data: I) -> Result<(), Error>
+    pub async fn insert_batch<'job, I>(&self, data: I) -> Result<(), Error>
     where
-        I: IntoIterator<Item = InsertJob<T>>,
+        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I::IntoIter: Send,
+        T: 'job,
     {
         let mut tx = self.pool.begin().await?;
         self.insert_batch_tx(data, &mut tx).await?;
@@ -201,21 +203,23 @@ where
         Ok(())
     }
 
-    pub fn insert_batch_tx<'a, 'c, A, I>(
+    pub fn insert_batch_tx<'a, 'c, 'job, A, I>(
         &self,
         data: I,
         tx: A,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + Send
     where
         A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
-        I: IntoIterator<Item = InsertJob<T>>,
+        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I::IntoIter: Send,
+        T: 'job,
     {
         async move {
             let mut conn = tx.acquire().await?;
             {
                 let mut sink = queries::InsertJobMany::copy_in_tx(&mut conn).await?;
                 for job in data {
-                    let value = serde_json::to_value(job.data)?;
+                    let value = serde_json::to_value(&job.data)?;
                     queries::InsertJobMany::builder()
                         .job_data(&value)
                         .max_attempts(job.max_attempts.into())
