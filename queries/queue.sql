@@ -94,3 +94,15 @@ SELECT pg_notify(
   sqlc.arg(channel_name)::TEXT,
   json_build_object('q', sqlc.arg(queue_name)::TEXT)::TEXT
 );
+
+-- name: RetryFailedByQueue :exec
+UPDATE tasuki_job j
+SET
+  status = 'pending'::tasuki_job_status,
+  attempts = 0,
+  scheduled_at = clock_timestamp(),
+  lease_expires_at = NULL
+WHERE
+  j.status = 'failed'::tasuki_job_status
+  AND j.attempts < j.max_attempts
+  AND j.queue_name = sqlc.arg(queue_name)::TEXT;

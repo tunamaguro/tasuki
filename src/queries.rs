@@ -948,3 +948,75 @@ impl<'a> AddJobNotifyBuilder<'a, (&'a str, &'a str)> {
         }
     }
 }
+#[derive(sqlx::FromRow)]
+pub struct RetryFailedByQueueRow {}
+pub struct RetryFailedByQueue<'a> {
+    queue_name: &'a str,
+}
+impl<'a> RetryFailedByQueue<'a> {
+    pub const QUERY: &'static str = r"UPDATE tasuki_job j
+SET
+  status = 'pending'::tasuki_job_status,
+  attempts = 0,
+  scheduled_at = clock_timestamp(),
+  lease_expires_at = NULL
+WHERE
+  j.status = 'failed'::tasuki_job_status
+  AND j.attempts < j.max_attempts
+  AND j.queue_name = $1::TEXT";
+    pub fn query_as(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        RetryFailedByQueueRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, RetryFailedByQueueRow>(Self::QUERY).bind(self.queue_name)
+    }
+    pub fn execute<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
+    + Send
+    + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            sqlx::query(Self::QUERY)
+                .bind(self.queue_name)
+                .execute(&mut *conn)
+                .await
+        }
+    }
+}
+impl<'a> RetryFailedByQueue<'a> {
+    pub const fn builder() -> RetryFailedByQueueBuilder<'a, ((),)> {
+        RetryFailedByQueueBuilder {
+            fields: ((),),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct RetryFailedByQueueBuilder<'a, Fields = ((),)> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> RetryFailedByQueueBuilder<'a, ((),)> {
+    pub fn queue_name(self, queue_name: &'a str) -> RetryFailedByQueueBuilder<'a, (&'a str,)> {
+        let ((),) = self.fields;
+        let _phantom = self._phantom;
+        RetryFailedByQueueBuilder {
+            fields: (queue_name,),
+            _phantom,
+        }
+    }
+}
+impl<'a> RetryFailedByQueueBuilder<'a, (&'a str,)> {
+    pub const fn build(self) -> RetryFailedByQueue<'a> {
+        let (queue_name,) = self.fields;
+        RetryFailedByQueue { queue_name }
+    }
+}

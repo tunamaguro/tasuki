@@ -141,6 +141,33 @@ impl<T> Client<T> {
             ..self
         }
     }
+
+    /// Admin: Retry all `failed` jobs in this client's queue.
+    ///
+    /// - Selects rows with `status='failed' AND attempts < max_attempts` and sets them to `pending`.
+    /// - Resets scheduling fields: `scheduled_at = clock_timestamp()`, `lease_expires_at = NULL`.
+    /// - Emits a single NOTIFY to wake up workers if any rows were affected.
+    pub async fn retry_failed(&self) -> Result<u64, Error> {
+        let res = queries::RetryFailedByQueue::builder()
+            .queue_name(&self.queue_name)
+            .build()
+            .execute(&self.pool)
+            .await?;
+
+        let count = res.rows_affected();
+        tracing::info!(queue_name = self.queue_name.as_ref(), count, "retry_failed_by_queue");
+
+        if count > 0 {
+            queries::AddJobNotify::builder()
+                .queue_name(&self.queue_name)
+                .channel_name(crate::worker::Listener::CHANNEL_NAME)
+                .build()
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(count)
+    }
 }
 
 impl<T> Client<T>
