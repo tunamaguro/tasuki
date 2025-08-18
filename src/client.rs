@@ -190,6 +190,10 @@ where
         }
     }
 
+    /// Insert multiple jobs into the queue using the client's connection pool.
+    ///
+    /// This method begins and commits its own transaction internally. For
+    /// batching within an existing transaction, use `insert_batch_tx`.
     pub async fn insert_batch<'job, I>(&self, data: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = &'job InsertJob<T>> + Send,
@@ -202,7 +206,14 @@ where
 
         Ok(())
     }
-    
+
+    /// Insert multiple jobs using an existing transaction or connection.
+    ///
+    /// - `data`: Iterator of job descriptors to enqueue.
+    /// - `tx`: A transaction/connection that implements `sqlx::Acquire`.
+    ///
+    /// Uses PostgreSQL COPY for efficient bulk insert and emits a single NOTIFY
+    /// after all rows are inserted to wake listeners.
     #[allow(clippy::manual_async_fn)]
     pub fn insert_batch_tx<'a, 'c, 'job, A, I>(
         &self,
