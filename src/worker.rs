@@ -335,14 +335,19 @@ where
     fn subscribe(
         self,
         listener: &mut Listener,
-    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M>;
+    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M>;
 
     fn subscribe_with_throttle(
         self,
         listener: &mut Listener,
         duration: std::time::Duration,
         count: usize,
-    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M>;
+    ) -> crate::Worker<
+        Throttle<futures::stream::Select<Tick, Subscribe>, Ticker>,
+        BackEnd<F::Data>,
+        F,
+        M,
+    >;
 }
 
 impl<Tick, F, M> WorkerWithListenerExt<Tick, F, M> for crate::Worker<Tick, BackEnd<F::Data>, F, M>
@@ -355,7 +360,7 @@ where
     fn subscribe(
         self,
         listener: &mut Listener,
-    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M> {
+    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M> {
         let backend = self.backend_ref();
         let subscribe = listener.subscribe(backend.queue_name.clone());
 
@@ -367,7 +372,12 @@ where
         listener: &mut Listener,
         duration: std::time::Duration,
         count: usize,
-    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M> {
+    ) -> crate::Worker<
+        Throttle<futures::stream::Select<Tick, Subscribe>, Ticker>,
+        BackEnd<F::Data>,
+        F,
+        M,
+    > {
         let backend = self.backend_ref();
         let subscribe = listener.subscribe(backend.queue_name.clone());
 
@@ -385,7 +395,7 @@ struct Publisher {
 
 pin_project! {
     #[derive(Debug)]
-    struct Subscribe {
+    pub struct Subscribe {
         #[pin]
         receiver: futures::channel::mpsc::Receiver<()>,
     }

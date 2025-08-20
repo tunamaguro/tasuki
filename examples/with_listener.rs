@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use tasuki::{
     BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
-    WorkerWithListenerExt,
+    worker::WorkerWithListenerExt,
 };
 
 #[tokio::main]

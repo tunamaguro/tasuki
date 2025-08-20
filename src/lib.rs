@@ -8,7 +8,7 @@ pub use client::{Client, Error as ClientError, InsertJob};
 
 pub mod worker;
 use futures::{FutureExt, Stream, StreamExt};
-pub use worker::{BackEnd, Listener, WorkerWithListenerExt};
+pub use worker::BackEnd;
 
 use crate::worker::Ticker;
 
