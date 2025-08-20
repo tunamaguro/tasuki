@@ -22,7 +22,7 @@ pin_project! {
 }
 
 impl Ticker {
-    fn new(period: std::time::Duration) -> Self {
+    pub(crate) fn new(period: std::time::Duration) -> Self {
         Self {
             inner: futures_timer::Delay::new(period),
             period,
@@ -153,6 +153,11 @@ where
 // Allow any Stream to call `.throttle(...)`.
 impl<St> ThrottleExt for St where St: Stream {}
 
+pub struct PostgresDriver;
+impl crate::BackEndDriver for PostgresDriver {
+    type Error = Error;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Categorization of failures that may occur while processing jobs.
 pub enum ErrorKind {
@@ -169,6 +174,15 @@ pub struct Error {
     #[allow(unused)]
     kind: ErrorKind,
     inner: Box<dyn std::error::Error + Send + 'static>,
+}
+
+impl Error {
+    fn new_database(error: Box<dyn std::error::Error + Send>) -> Self {
+        Error {
+            kind: ErrorKind::DataBase,
+            inner: error,
+        }
+    }
 }
 
 impl From<sqlx::Error> for Error {
@@ -341,17 +355,22 @@ impl Stream for Subscribe {
 }
 
 #[derive(Debug)]
-struct OutTxContext {
+pub struct OutTxContext {
     id: sqlx::types::Uuid,
     pool: sqlx::PgPool,
     lease_token: sqlx::types::Uuid,
-    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
+    interval: std::time::Duration,
+    lease_interval: sqlx::postgres::types::PgInterval,
 }
 
-impl OutTxContext {
-    async fn heartbeat(&self) -> Result<(), Error> {
+impl crate::BackEndContext for OutTxContext {
+    type Driver = PostgresDriver;
+    fn heartbeat_interval(&mut self) -> std::time::Duration {
+        self.interval
+    }
+    async fn heartbeat(&mut self) -> Result<(), <Self::Driver as crate::BackEndDriver>::Error> {
         let res = queries::HeartBeatJob::builder()
-            .lease_interval(self.lease_interval.as_ref())
+            .lease_interval(&self.lease_interval)
             .id(self.id)
             .lease_token(Some(self.lease_token))
             .build()
@@ -366,8 +385,7 @@ impl OutTxContext {
         }
         Ok(())
     }
-
-    async fn complete(&self) -> Result<(), Error> {
+    async fn complete(self) -> Result<(), <Self::Driver as crate::BackEndDriver>::Error> {
         let res = queries::CompleteJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
@@ -383,8 +401,7 @@ impl OutTxContext {
         }
         Ok(())
     }
-
-    async fn cancel(&self) -> Result<(), Error> {
+    async fn cancel(self) -> Result<(), <Self::Driver as crate::BackEndDriver>::Error> {
         let res = queries::CancelJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
@@ -400,8 +417,10 @@ impl OutTxContext {
         }
         Ok(())
     }
-
-    async fn retry(&self, retry_after: Option<std::time::Duration>) -> Result<(), Error> {
+    async fn retry(
+        self,
+        retry_after: Option<std::time::Duration>,
+    ) -> Result<(), <Self::Driver as crate::BackEndDriver>::Error> {
         let interval = retry_after
             .map(|duration| {
                 sqlx::postgres::types::PgInterval::try_from(duration).map_err(|e| Error {
@@ -427,58 +446,49 @@ impl OutTxContext {
         Ok(())
     }
 }
-
-struct Job<T> {
-    context: OutTxContext,
-    data: T,
-}
+type Job<T> = crate::Job<T, OutTxContext>;
 
 #[derive(Debug, Clone)]
 /// Backend for fetching and updating jobs in the database.
 ///
 /// A `BackEnd` wraps a [`sqlx::PgPool`] and the name of the queue to pull
 /// jobs from. It is consumed by [`Worker`] to obtain work items.
-pub struct BackEnd {
+pub struct BackEnd<T> {
     pool: sqlx::PgPool,
     queue_name: std::borrow::Cow<'static, str>,
+    lease_time: std::time::Duration,
+    marker: std::marker::PhantomData<fn() -> T>,
 }
 
-impl BackEnd {
-    /// Create a new backend using the given connection pool.
-    pub fn new(pool: sqlx::PgPool) -> BackEnd {
-        BackEnd {
-            pool,
-            queue_name: super::TASUKI_DEFAULT_QUEUE_NAME.into(),
-        }
-    }
+impl<T> crate::BackEndPoller for BackEnd<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    type Driver = PostgresDriver;
+    type Data = T;
+    type Context = OutTxContext;
 
-    /// Override the queue name from which jobs are fetched.
-    pub fn queue_name<S>(self, queue_name: S) -> Self
-    where
-        S: Into<std::borrow::Cow<'static, str>>,
-    {
-        Self {
-            queue_name: queue_name.into(),
-            ..self
-        }
-    }
+    async fn poll_job(
+        &mut self,
+        batch_size: usize,
+    ) -> Vec<
+        Result<
+            crate::Job<Self::Data, Self::Context>,
+            <Self::Driver as crate::BackEndDriver>::Error,
+        >,
+    > {
+        let lease_interval = sqlx::postgres::types::PgInterval::try_from(self.lease_time)
+            .map_err(|error| Error::new_database(error));
 
-    pub async fn listener(&self) -> Result<Listener, sqlx::Error> {
-        Listener::new(self.pool.clone()).await
-    }
+        let lease_interval = match lease_interval {
+            Ok(v) => v,
+            Err(error) => return vec![Err(error)],
+        };
 
-    async fn get_job<T>(
-        &self,
-        batch_size: u16,
-        lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-    ) -> Vec<Result<Job<T>, Error>>
-    where
-        T: DeserializeOwned,
-    {
         let builder = queries::GetAvailableJobs::builder()
-            .lease_interval(lease_interval.as_ref())
+            .lease_interval(&lease_interval)
             .queue_name(&self.queue_name)
-            .batch_size(i32::from(batch_size))
+            .batch_size(i32::try_from(batch_size).unwrap_or(32))
             .build();
 
         builder
@@ -497,535 +507,25 @@ impl BackEnd {
                         id: row.id,
                         pool: self.pool.clone(),
                         lease_token,
-                        lease_interval: lease_interval.clone(),
+                        interval: self.lease_time,
+                        lease_interval,
                     };
                     Ok(Job { context, data })
                 }
-                Err(e) => Err(Error::from(e)),
+                Err(db_error) => Err(Error::from(db_error)),
             })
             .collect::<Vec<_>>()
             .await
     }
-
-    #[allow(dead_code)]
-    fn into_datastream<S, T>(
-        self,
-        tick: S,
-        batch_size: u16,
-        lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-    ) -> impl Stream<Item = Result<Job<T>, Error>>
-    where
-        S: Stream,
-        T: DeserializeOwned,
-    {
-        tick.then(move |_| {
-            let backend = self.clone();
-            let lease_interval = lease_interval.clone();
-            async move { backend.get_job::<T>(batch_size, lease_interval).await }
-        })
-        .flat_map(futures::stream::iter)
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-/// Outcome produced by a job handler.
-pub enum JobResult {
-    /// Mark the job as successfully completed.
-    Complete,
-    /// Requeue the job after an optional delay.
-    Retry(Option<std::time::Duration>),
-    /// Cancel the job without retrying.
-    Cancel,
-}
-
-/// Trait implemented by functions that process a job.
-///
-/// The `M` type parameter determines which combination of [`JobData`] and
-/// [`WorkerContext`] the handler expects. The associated [`Data`] type
-/// specifies the payload that the job carries.
-pub trait JobHandler<M>: Send + Sync + Clone + 'static {
-    /// The job data type handled by this function.
-    type Data;
-    /// Type of the shared context provided to the handler.
-    type Context;
-
-    /// Future returned by the handler.
-    type Future: Future<Output = JobResult> + Send;
-
-    /// Invoke the handler with the job data and worker context.
-    fn call(self, data: Self::Data, context: Self::Context) -> Self::Future;
-}
-
-/// Wrapper passed to handlers that request the job payload.
-pub struct JobData<T>(pub T);
-
-/// Wrapper passed to handlers that require access to shared context.
-pub struct WorkerContext<S>(pub S);
-
-impl<F, Fut> JobHandler<()> for F
-where
-    F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = JobResult> + Send,
-{
-    type Data = serde_json::Value;
-    type Context = ();
-    type Future = Fut;
-
-    fn call(self, _data: Self::Data, _context: Self::Context) -> Self::Future {
-        self()
-    }
-}
-
-impl<F, Fut, T> JobHandler<JobData<T>> for F
-where
-    F: FnOnce(JobData<T>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = JobResult> + Send,
-{
-    type Data = T;
-    type Context = ();
-    type Future = Fut;
-
-    fn call(self, data: Self::Data, _context: Self::Context) -> Self::Future {
-        self(JobData(data))
-    }
-}
-
-impl<F, Fut, S> JobHandler<WorkerContext<S>> for F
-where
-    F: FnOnce(WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = JobResult> + Send,
-{
-    type Data = serde_json::Value;
-    type Context = S;
-    type Future = Fut;
-
-    fn call(self, _data: Self::Data, context: Self::Context) -> Self::Future {
-        self(WorkerContext(context))
-    }
-}
-
-impl<F, Fut, T, S> JobHandler<(JobData<T>, WorkerContext<S>)> for F
-where
-    F: FnOnce(JobData<T>, WorkerContext<S>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = JobResult> + Send,
-{
-    type Data = T;
-    type Context = S;
-    type Future = Fut;
-
-    fn call(self, data: Self::Data, context: Self::Context) -> Self::Future {
-        self(JobData(data), WorkerContext(context))
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Polls for jobs and executes them using the provided handler.
-///
-/// The generic parameters allow customizing the ticker stream (`Tick`),
-/// job handler (`F`), shared context (`Ctx`) and marker type (`M`) that
-/// specifies which arguments are supplied to the handler.
-pub struct Worker<Tick, F, Ctx, M> {
-    tick: Tick,
-    concurrent: usize,
-    job_handler: F,
-    context: Ctx,
-    backend: BackEnd,
-    heartbeat_every: std::time::Duration,
-    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-    _marker: std::marker::PhantomData<M>,
-}
-
-impl<Tick, F, Ctx, M> Worker<Tick, F, Ctx, M>
-where
-    Tick: Stream<Item = ()>,
-    F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned + 'static,
-    Ctx: Clone,
-{
-    pub fn with_graceful_shutdown<Signal>(
-        self,
-        signal: Signal,
-    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
-    where
-        Signal: Future,
-    {
-        WorkerWithGracefulShutdown {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: self.job_handler,
-            context: self.context,
-            backend: self.backend,
-            heartbeat_every: self.heartbeat_every,
-            lease_interval: self.lease_interval,
-            _marker: self._marker,
-            signal,
-        }
-    }
-
-    /// Combine periodic ticks with DB LISTEN notifications and apply a
-    /// small throttle to coalesce bursts.
-    ///
-    /// Notes
-    /// - The resulting stream is throttled to at most 1 event every
-    ///   100ms. This protects the database from hot loops when many
-    ///   notifications arrive at once and reduces redundant fetches.
-    pub fn subscribe(
-        self,
-        listener: &mut Listener,
-    ) -> WorkerWithSubscribe<impl Stream<Item = ()> + use<Tick, F, Ctx, M>, F, Ctx, M> {
-        let subscribe = listener.subscribe(self.backend.queue_name.clone());
-        let tick_stream = futures::stream::select(self.tick.map(|_| ()), subscribe)
-            .throttle(std::time::Duration::from_millis(100), 1);
-
-        WorkerWithSubscribe {
-            tick: tick_stream,
-            concurrent: self.concurrent,
-            job_handler: self.job_handler,
-            context: self.context,
-            backend: self.backend,
-            heartbeat_every: self.heartbeat_every,
-            lease_interval: self.lease_interval,
-            _marker: self._marker,
-        }
-    }
-
-    /// Start polling the backend and executing jobs until the stream
-    /// terminates.
-    pub async fn run(self) {
-        run_worker(
-            self.tick,
-            self.job_handler,
-            self.context,
-            self.backend,
-            self.concurrent,
-            self.heartbeat_every,
-            self.lease_interval,
-        )
-        .await
-    }
-}
-
-pub struct WorkerWithSubscribe<Tick, F, Ctx, M> {
-    /// Tick stream that is already throttled.
-    ///
-    /// This worker variant applies a built-in throttle of 1 event per 100ms
-    /// to the combined tick/subscribe stream created by [`Worker::subscribe`].
-    /// This is intentional to limit fetch frequency during notification
-    /// bursts and prevent tight polling loops.
-    tick: Throttle<Tick, Ticker>,
-    concurrent: usize,
-    job_handler: F,
-    context: Ctx,
-    backend: BackEnd,
-    heartbeat_every: std::time::Duration,
-    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-    _marker: std::marker::PhantomData<M>,
-}
-
-impl<Tick, F, Ctx, M> WorkerWithSubscribe<Tick, F, Ctx, M>
-where
-    Tick: Stream<Item = ()>,
-    F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned + 'static,
-    Ctx: Clone + Send,
-{
-    pub fn with_graceful_shutdown<Signal>(
-        self,
-        signal: Signal,
-    ) -> WorkerWithGracefulShutdown<impl Stream<Item = ()>, F, Ctx, M, Signal>
-    where
-        Signal: Future,
-    {
-        WorkerWithGracefulShutdown {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: self.job_handler,
-            context: self.context,
-            backend: self.backend,
-            heartbeat_every: self.heartbeat_every,
-            lease_interval: self.lease_interval,
-            _marker: self._marker,
-            signal,
-        }
-    }
-
-    pub async fn run(self) {
-        run_worker(
-            self.tick,
-            self.job_handler,
-            self.context,
-            self.backend,
-            self.concurrent,
-            self.heartbeat_every,
-            self.lease_interval,
-        )
-        .await
-    }
-}
-
-pub struct WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal> {
-    tick: Tick,
-    concurrent: usize,
-    job_handler: F,
-    context: Ctx,
-    backend: BackEnd,
-    heartbeat_every: std::time::Duration,
-    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-    _marker: std::marker::PhantomData<M>,
-    signal: Signal,
-}
-
-impl<Tick, F, Ctx, M, Signal> WorkerWithGracefulShutdown<Tick, F, Ctx, M, Signal>
-where
-    Tick: Stream<Item = ()>,
-    F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned + Send + 'static,
-    Ctx: Clone,
-    Signal: Future,
-{
-    pub async fn run(self) {
-        let tick = self.tick.take_until(self.signal);
-        run_worker(
-            tick,
-            self.job_handler,
-            self.context,
-            self.backend,
-            self.concurrent,
-            self.heartbeat_every,
-            self.lease_interval,
-        )
-        .await
-    }
-}
-
-async fn run_worker<Tick, F, M, Ctx>(
-    tick: Tick,
-    handler: F,
-    worker_context: Ctx,
-    backend: BackEnd,
-    concurrent: usize,
-    heartbeat_every: std::time::Duration,
-    lease_interval: std::sync::Arc<sqlx::postgres::types::PgInterval>,
-) where
-    Tick: Stream<Item = ()>,
-    F: JobHandler<M, Context = Ctx>,
-    F::Data: DeserializeOwned,
-    Ctx: Clone,
-{
-    // Helper to run a single job with heartbeat and finalization
-    async fn run_one_job<F, M, Ctx>(
-        job: Job<F::Data>,
-        handler: F,
-        worker_context: Ctx,
-        heartbeat_every: std::time::Duration,
-    ) -> ()
-    where
-        F: JobHandler<M, Context = Ctx>,
-        Ctx: Clone,
-    {
-        let Job {
-            context: job_context,
-            data,
-        } = job;
-        tracing::trace!("Start handler");
-        let result = {
-            let mut ticker = Ticker::new(heartbeat_every).fuse();
-
-            let mut handler_fut = handler
-                .clone()
-                .call(data, worker_context.clone())
-                .boxed()
-                .fuse();
-            loop {
-                futures::select! {
-                    res = handler_fut => break res,
-                    _ = ticker.next() =>{
-                        let _res = job_context.heartbeat().await.inspect_err(
-                            |error| tracing::error!(error = %error, job_id = %job_context.id, "Failed to heartbeat job"),
-                        );
-                    }
-                }
-            }
-        };
-        tracing::trace!("Finish handler");
-
-        let _ = match result {
-            JobResult::Complete => job_context
-                .complete()
-                .await
-                .inspect_err(|error| tracing::error!(error = %error, "Failed to complete job")),
-            JobResult::Retry(duration) => job_context
-                .retry(duration)
-                .await
-                .inspect_err(|error| tracing::error!(error = %error, "Failed to retry job")),
-            JobResult::Cancel => job_context
-                .cancel()
-                .await
-                .inspect_err(|error| tracing::error!(error = %error, "Failed to cancel job")),
-        };
-    }
-
-    let tick = tick.fuse();
-    futures::pin_mut!(tick);
-    let mut tasks = futures::stream::FuturesUnordered::new();
-    let mut in_flight: usize = 0;
-
-    loop {
-        futures::select! {
-            tick_val = tick.next() => {
-                // If tick stream ended (e.g., graceful shutdown), stop fetching
-                if tick_val.is_none() { break; }
-
-                let free = concurrent.saturating_sub(in_flight) as u16;
-                if free > 0 {
-                    let results = backend.get_job::<F::Data>(free, lease_interval.clone()).await;
-                    for res in results {
-                        match res {
-                            Ok(job) => {
-                                in_flight += 1;
-                                let fut = run_one_job::<F, M, Ctx>(
-                                    job,
-                                    handler.clone(),
-                                    worker_context.clone(),
-                                    heartbeat_every,
-                                );
-                                tasks.push(fut);
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, "Failed to fetch job");
-                            }
-                        }
-                    }
-                }
-            },
-            _ = tasks.next() => {
-                in_flight = in_flight.saturating_sub(1);
-            },
-        }
-    }
-
-    // Drain remaining tasks
-    while tasks.next().await.is_some() {}
-}
-
-/// Builder for configuring and constructing [`Worker`] instances.
-///
-/// By default it polls every second with no shared context and a
-/// concurrency limit of eight.
-pub struct WorkerBuilder<Tick = Ticker, Ctx = ()> {
-    tick: Tick,
-    context: Ctx,
-    concurrent: usize,
-    lease_duration: std::time::Duration,
-    heartbeat_every: std::time::Duration,
-}
-
-impl Default for WorkerBuilder<Ticker, ()> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WorkerBuilder<Ticker, ()> {
-    /// Create a new builder with default configuration.
-    pub fn new() -> Self {
-        const LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
-
-        let ticker = Ticker::new(std::time::Duration::from_secs(5));
-        WorkerBuilder {
-            tick: ticker,
-            context: (),
-            concurrent: 8,
-            lease_duration: LEASE_DURATION,
-            heartbeat_every: LEASE_DURATION / 3,
-        }
-    }
-}
-
-impl<Tick, Ctx> WorkerBuilder<Tick, Ctx> {
-    /// Replace the ticker driving the polling loop.
-    pub fn tick<Tick2>(self, tick: Tick2) -> WorkerBuilder<Tick2, Ctx>
-    where
-        Tick2: Stream<Item = ()>,
-    {
-        WorkerBuilder {
-            tick,
-            context: self.context,
-            concurrent: self.concurrent,
-            lease_duration: self.lease_duration,
-            heartbeat_every: self.heartbeat_every,
-        }
-    }
-
-    /// Provide shared context that will be passed to every job handler.
-    pub fn context<Ctx2>(self, context: Ctx2) -> WorkerBuilder<Tick, Ctx2>
-    where
-        Ctx2: Clone,
-    {
-        WorkerBuilder {
-            context,
-            tick: self.tick,
-            concurrent: self.concurrent,
-            lease_duration: self.lease_duration,
-            heartbeat_every: self.heartbeat_every,
-        }
-    }
-
-    /// Set the maximum number of jobs processed concurrently.
-    pub fn concurrent(self, concurrent: usize) -> Self {
-        Self { concurrent, ..self }
-    }
-
-    /// Set the job lease duration used for claiming and extending leases.
-    pub fn lease_duration(self, lease_duration: std::time::Duration) -> Self {
+impl<T> BackEnd<T> {
+    pub const fn new(pool: sqlx::PgPool) -> Self {
         Self {
-            lease_duration,
-            ..self
-        }
-    }
-
-    /// Set how often to send heartbeats while a job is running.
-    pub fn heartbeat_every(self, period: std::time::Duration) -> Self {
-        Self {
-            heartbeat_every: period,
-            ..self
-        }
-    }
-}
-
-impl<Ctx> WorkerBuilder<Ticker, Ctx> {
-    /// Adjust how frequently the worker polls for new jobs.
-    pub fn polling_interval(self, period: std::time::Duration) -> Self {
-        let ticker = Ticker::new(period);
-        WorkerBuilder {
-            tick: ticker,
-            ..self
-        }
-    }
-}
-
-impl<Tick, Ctx> WorkerBuilder<Tick, Ctx>
-where
-    Tick: Stream<Item = ()>,
-    Ctx: Clone,
-{
-    pub fn build<F, M>(self, backend: BackEnd, f: F) -> Worker<Tick, F, Ctx, M>
-    where
-        F: JobHandler<M, Context = Ctx>,
-    {
-        let lease_interval = std::sync::Arc::new(
-            sqlx::postgres::types::PgInterval::try_from(self.lease_duration)
-                .expect("invalid lease duration"),
-        );
-        Worker {
-            tick: self.tick,
-            concurrent: self.concurrent,
-            job_handler: f,
-            context: self.context,
-            backend,
-            heartbeat_every: self.heartbeat_every,
-            lease_interval,
-            _marker: std::marker::PhantomData,
+            pool,
+            queue_name: std::borrow::Cow::Borrowed(super::TASUKI_DEFAULT_QUEUE_NAME),
+            marker: std::marker::PhantomData,
+            lease_time: std::time::Duration::from_secs(30),
         }
     }
 }
