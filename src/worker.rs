@@ -337,6 +337,7 @@ where
         listener: &mut Listener,
     ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M>;
 
+    #[allow(clippy::type_complexity)]
     fn subscribe_with_throttle(
         self,
         listener: &mut Listener,

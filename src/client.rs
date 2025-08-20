@@ -155,7 +155,11 @@ impl<T> Client<T> {
             .await?;
 
         let count = res.rows_affected();
-        tracing::info!(queue_name = self.queue_name.as_ref(), count, "retry_failed_by_queue");
+        tracing::info!(
+            queue_name = self.queue_name.as_ref(),
+            count,
+            "retry_failed_by_queue"
+        );
 
         if count > 0 {
             queries::AddJobNotify::builder()
