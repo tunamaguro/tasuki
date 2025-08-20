@@ -8,7 +8,7 @@ pub use client::{Client, Error as ClientError, InsertJob};
 
 pub mod worker;
 use futures::{FutureExt, Stream, StreamExt};
-pub use worker::BackEnd;
+pub use worker::{BackEnd, Listener, WorkerWithListenerExt};
 
 use crate::worker::Ticker;
 
@@ -171,6 +171,10 @@ where
     F::Context: Clone,
     Poller: BackEndPoller<Data = F::Data>,
 {
+    pub fn backend_ref(&self) -> &Poller {
+        &self.poller
+    }
+
     pub fn modify_stream<ModFn, Tick2>(self, func: ModFn) -> Worker<Tick2, Poller, F, M>
     where
         ModFn: FnOnce(Tick) -> Tick2,
@@ -317,10 +321,10 @@ pub struct WorkerBuilder<Tick = (), Handler = (), M = (), Ctx = ()> {
 
 impl WorkerBuilder<(), (), (), ()> {
     pub fn new(interval: std::time::Duration) -> WorkerBuilder<Ticker, (), (), ()> {
-        Self::new_with_ticker(Ticker::new(interval))
+        Self::new_with_tick(Ticker::new(interval))
     }
 
-    pub fn new_with_ticker<Tick>(tick: Tick) -> WorkerBuilder<Tick, (), (), ()> {
+    pub fn new_with_tick<Tick>(tick: Tick) -> WorkerBuilder<Tick, (), (), ()> {
         WorkerBuilder {
             tick,
             concurrent: 4,

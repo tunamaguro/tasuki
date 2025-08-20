@@ -325,6 +325,58 @@ impl Listener {
     }
 }
 
+pub trait WorkerWithListenerExt<Tick, F, M>
+where
+    Tick: crate::TickStream,
+    F: crate::JobHandler<M>,
+    F::Data: DeserializeOwned,
+    F::Context: Clone,
+{
+    fn subscribe(
+        self,
+        listener: &mut Listener,
+    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M>;
+
+    fn subscribe_with_throttle(
+        self,
+        listener: &mut Listener,
+        duration: std::time::Duration,
+        count: usize,
+    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M>;
+}
+
+impl<Tick, F, M> WorkerWithListenerExt<Tick, F, M> for crate::Worker<Tick, BackEnd<F::Data>, F, M>
+where
+    Tick: crate::TickStream,
+    F: crate::JobHandler<M>,
+    F::Data: DeserializeOwned,
+    F::Context: Clone,
+{
+    fn subscribe(
+        self,
+        listener: &mut Listener,
+    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M> {
+        let backend = self.backend_ref();
+        let subscribe = listener.subscribe(backend.queue_name.clone());
+
+        self.modify_stream(|tick| futures::stream::select(tick, subscribe))
+    }
+
+    fn subscribe_with_throttle(
+        self,
+        listener: &mut Listener,
+        duration: std::time::Duration,
+        count: usize,
+    ) -> crate::Worker<impl crate::TickStream, BackEnd<F::Data>, F, M> {
+        let backend = self.backend_ref();
+        let subscribe = listener.subscribe(backend.queue_name.clone());
+
+        self.modify_stream(|tick| {
+            futures::stream::select(tick, subscribe).throttle(duration, count)
+        })
+    }
+}
+
 #[derive(Debug)]
 struct Publisher {
     sender: futures::channel::mpsc::Sender<()>,
@@ -527,6 +579,10 @@ impl<T> BackEnd<T> {
             marker: std::marker::PhantomData,
             lease_time: std::time::Duration::from_secs(30),
         }
+    }
+
+    pub async fn listener(&self) -> Result<Listener, sqlx::Error> {
+        Listener::new(self.pool.clone()).await
     }
 }
 
