@@ -21,6 +21,7 @@ async fn main() {
     let mut listener = backend.listener().await.unwrap();
 
     let worker = WorkerBuilder::new_with_tick(futures::stream::pending())
+        .concurrent(16)
         .handler(job_handler)
         .build(backend);
 

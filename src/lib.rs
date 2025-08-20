@@ -202,11 +202,25 @@ where
     pub fn with_graceful_shutdown<Signal>(
         self,
         signal: Signal,
-    ) -> Worker<impl TickStream, Poller, F, M>
+    ) -> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
     where
         Signal: Future<Output = ()> + Send,
     {
-        self.modify_stream(|st| st.take_until(signal))
+        let Self {
+            tick,
+            poller,
+            handler,
+            context,
+            concurrent,
+        } = self;
+        WorkerWithGracefulShutdown {
+            tick,
+            poller,
+            handler,
+            context,
+            concurrent,
+            signal,
+        }
     }
 
     pub fn run(self) -> impl Future<Output = ()> + Send {
@@ -216,25 +230,63 @@ where
             self.context,
             self.poller,
             self.concurrent,
+            std::future::pending::<()>(),
         )
     }
 }
 
-async fn run_worker<Tick, Poller, F, M>(
+pub struct WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
+where
+    Tick: TickStream,
+    F: JobHandler<M>,
+    Poller: BackEndPoller<Data = F::Data>,
+    Signal: Future<Output = ()> + Send,
+{
+    tick: Tick,
+    poller: Poller,
+    handler: F,
+    context: F::Context,
+    concurrent: usize,
+    signal: Signal,
+}
+
+impl<Tick, Poller, F, M, Signal> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
+where
+    Tick: TickStream,
+    F: JobHandler<M>,
+    F::Context: Clone,
+    Poller: BackEndPoller<Data = F::Data>,
+    Signal: Future<Output = ()> + Send,
+{
+    pub fn run(self) -> impl Future<Output = ()> + Send {
+        run_worker(
+            self.tick,
+            self.handler,
+            self.context,
+            self.poller,
+            self.concurrent,
+            self.signal,
+        )
+    }
+}
+
+async fn run_worker<Tick, Poller, F, M, Signal>(
     tick: Tick,
     handler: F,
     worker_context: F::Context,
     mut poller: Poller,
     concurrent: usize,
+    signal: Signal,
 ) where
     Tick: TickStream,
     F: JobHandler<M>,
     F::Context: Clone,
     Poller: BackEndPoller<Data = F::Data>,
+    Signal: Future + Send,
 {
     let mut tick = tick.boxed().fuse();
     let mut tasks = futures::stream::FuturesUnordered::new();
-    let mut in_flight = 0;
+    let mut signal = signal.boxed().fuse();
 
     loop {
         futures::select! {
@@ -242,7 +294,7 @@ async fn run_worker<Tick, Poller, F, M>(
                 // If tick stream ended (e.g., graceful shutdown), stop fetching
                 if tick_val.is_none() { break; }
 
-                let free = concurrent.saturating_sub(in_flight);
+                let free = concurrent.saturating_sub(tasks.len());
                 if free == 0 {
                     continue;
                 }
@@ -251,7 +303,6 @@ async fn run_worker<Tick, Poller, F, M>(
                 for job in polled_jobs {
                     match job {
                         Ok(job) => {
-                            in_flight += 1;
                             let fut = handle_one_job::<F,M,Poller>(job,handler.clone(),worker_context.clone());
                             tasks.push(fut);
                         },
@@ -262,9 +313,11 @@ async fn run_worker<Tick, Poller, F, M>(
                 }
 
             },
-            _ = tasks.next() => {
-                in_flight = in_flight.saturating_sub(1);
-            },
+            _ = tasks.next() => { },
+            _ = signal => {
+                tracing::trace!("received graceful shutdown signal. waiting for {} job(s) to finish", tasks.len());
+                break;
+            }
         }
     }
 
