@@ -12,7 +12,9 @@ async fn main() {
         .unwrap();
 
     let backend = BackEnd::new(pool.clone());
-    let worker = WorkerBuilder::new().build(backend, job_handler);
+    let worker = WorkerBuilder::new(std::time::Duration::from_secs(10))
+        .handler(job_handler)
+        .build(backend);
 
     let client = Client::<u64>::new(pool.clone());
     let client_handle = async move {

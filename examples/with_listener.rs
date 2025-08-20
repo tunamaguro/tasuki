@@ -1,5 +1,8 @@
 use futures::FutureExt;
-use tasuki::{BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext};
+use tasuki::{
+    BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
+    worker::WorkerWithListenerExt,
+};
 
 #[tokio::main]
 async fn main() {
@@ -17,11 +20,18 @@ async fn main() {
     let backend = BackEnd::new(pool.clone());
     let mut listener = backend.listener().await.unwrap();
 
-    let worker = WorkerBuilder::new()
-        .tick(futures::stream::pending())
-        .build(backend, job_handler)
-        .subscribe(&mut listener)
-        .with_graceful_shutdown(token.clone().cancelled_owned());
+    let worker = WorkerBuilder::new_with_tick(futures::stream::pending())
+        .concurrent(16)
+        .handler(job_handler)
+        .build(backend);
+
+    let worker = WorkerWithListenerExt::subscribe_with_throttle(
+        worker,
+        &mut listener,
+        std::time::Duration::from_millis(100),
+        1,
+    )
+    .with_graceful_shutdown(token.clone().cancelled_owned());
 
     let client = Client::<u64>::new(pool.clone());
     let client_token = token.clone();
