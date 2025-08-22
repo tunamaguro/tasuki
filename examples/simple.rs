@@ -1,9 +1,8 @@
 use pin_project_lite::pin_project;
-use tasuki_core::{
-    JobData, JobResult, WorkerContext,
-    worker::{JobSpawner, WorkerBuilder},
+use tasuki::{
+    BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
+    worker::JobSpawner,
 };
-use tasuki_sqlx::{BackEnd, Client, InsertJob};
 
 #[tokio::main]
 async fn main() {
