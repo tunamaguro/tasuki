@@ -24,7 +24,7 @@ WHERE
     FOR UPDATE SKIP LOCKED
     LIMIT sqlc.arg(batch_size)
   )
-RETURNING j.id, j.job_data, j.lease_token::UUID;
+RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token;
 
 -- name: HeartBeatJob :exec
 UPDATE 

@@ -224,8 +224,6 @@ where
             .batch_size(i32::try_from(batch_size).unwrap_or(32))
             .build();
 
-        
-
         builder
             .query_as()
             .fetch(&self.pool)
@@ -235,7 +233,7 @@ where
                     let context = OutTxContext {
                         id: row.id,
                         pool: self.pool.clone(),
-                        lease_token: row.j_lease_token,
+                        lease_token: row.lease_token,
                         interval: self.lease_time,
                         lease_interval,
                     };
