@@ -1,7 +1,5 @@
-use pin_project_lite::pin_project;
 use tasuki::{
     BackEnd, Client, InsertJob, JobData, JobResult, TokioSpawner, WorkerBuilder, WorkerContext,
-    worker::JobSpawner,
 };
 
 #[tokio::main]

@@ -33,7 +33,6 @@ tasuki-sqlx = { path = "./crates/tasuki-sqlx" }
 
 [dev-dependencies]
 futures = { workspace = true }
-pin-project-lite = { workspace = true }
 
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"] }
 serde = "1.0"
