@@ -31,4 +31,8 @@ test:
 
 # Generate by sqlc
 generate:
-    sqlc generate -f sqlc.json
+    sqlc generate -f crates/tasuki-sqlx/sqlc.json
+
+# Reset database
+reset-db:
+    sqlx database reset --source crates/tasuki-sqlx/migrations

@@ -103,8 +103,8 @@ impl std::error::Error for Error {
     }
 }
 
-#[derive(Debug)]
 /// A handle used to enqueue jobs into a PostgreSQL-backed queue.
+#[derive(Debug)]
 pub struct Client<T> {
     pool: sqlx::PgPool,
     queue_name: std::borrow::Cow<'static, str>,
@@ -126,7 +126,7 @@ impl<T> Client<T> {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            queue_name: super::TASUKI_DEFAULT_QUEUE_NAME.into(),
+            queue_name: super::DEFAULT_QUEUE_NAME.into(),
             data_type: std::marker::PhantomData,
         }
     }
@@ -140,37 +140,6 @@ impl<T> Client<T> {
             queue_name: queue_name.into(),
             ..self
         }
-    }
-
-    /// Admin: Retry all `failed` jobs in this client's queue.
-    ///
-    /// - Selects rows with `status='failed' AND attempts < max_attempts` and sets them to `pending`.
-    /// - Resets scheduling fields: `scheduled_at = clock_timestamp()`, `lease_expires_at = NULL`.
-    /// - Emits a single NOTIFY to wake up workers if any rows were affected.
-    pub async fn retry_failed(&self) -> Result<u64, Error> {
-        let res = queries::RetryFailedByQueue::builder()
-            .queue_name(&self.queue_name)
-            .build()
-            .execute(&self.pool)
-            .await?;
-
-        let count = res.rows_affected();
-        tracing::info!(
-            queue_name = self.queue_name.as_ref(),
-            count,
-            "retry_failed_by_queue"
-        );
-
-        if count > 0 {
-            queries::AddJobNotify::builder()
-                .queue_name(&self.queue_name)
-                .channel_name(crate::worker::Listener::CHANNEL_NAME)
-                .build()
-                .execute(&self.pool)
-                .await?;
-        }
-
-        Ok(count)
     }
 }
 
@@ -212,7 +181,7 @@ where
 
             queries::AddJobNotify::builder()
                 .queue_name(&self.queue_name)
-                .channel_name(crate::worker::Listener::CHANNEL_NAME)
+                .channel_name(crate::NOTIFY_CHANNEL_NAME)
                 .build()
                 .execute(&mut *conn)
                 .await?;
@@ -280,7 +249,7 @@ where
 
             queries::AddJobNotify::builder()
                 .queue_name(&self.queue_name)
-                .channel_name(crate::worker::Listener::CHANNEL_NAME)
+                .channel_name(crate::NOTIFY_CHANNEL_NAME)
                 .build()
                 .execute(&mut *conn)
                 .await?;

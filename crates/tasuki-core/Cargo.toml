@@ -1,0 +1,22 @@
+[package]
+name = "tasuki-core"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+resolver = "3"
+
+[features]
+default = ["rt-tokio"]
+rt-tokio = ["tokio"]
+
+[dependencies]
+futures = { workspace = true }
+pin-project-lite = { workspace = true }
+tracing = { workspace = true }
+
+futures-timer = "3.0"
+trait-variant = "0.1.2"
+
+tokio = { version = "1.0", default-features = false, features = [
+    "rt",
+], optional = true }
