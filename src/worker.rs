@@ -325,43 +325,43 @@ impl Listener {
     }
 }
 
-pub trait WorkerWithListenerExt<Tick, F, M>
+type ThrottleTick<Tick> = Throttle<futures::stream::Select<Tick, Subscribe>, Ticker>;
+pub trait WorkerWithListenerExt<Tick, F, M, Sp>
 where
     Tick: crate::TickStream,
     F: crate::JobHandler<M>,
     F::Data: DeserializeOwned,
+    M: 'static,
     F::Context: Clone,
+    Sp: crate::JobSpawner,
 {
     fn subscribe(
         self,
         listener: &mut Listener,
-    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M>;
+    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M, Sp>;
 
-    #[allow(clippy::type_complexity)]
     fn subscribe_with_throttle(
         self,
         listener: &mut Listener,
         duration: std::time::Duration,
         count: usize,
-    ) -> crate::Worker<
-        Throttle<futures::stream::Select<Tick, Subscribe>, Ticker>,
-        BackEnd<F::Data>,
-        F,
-        M,
-    >;
+    ) -> crate::Worker<ThrottleTick<Tick>, BackEnd<F::Data>, F, M, Sp>;
 }
 
-impl<Tick, F, M> WorkerWithListenerExt<Tick, F, M> for crate::Worker<Tick, BackEnd<F::Data>, F, M>
+impl<Tick, F, M, Sp> WorkerWithListenerExt<Tick, F, M, Sp>
+    for crate::Worker<Tick, BackEnd<F::Data>, F, M, Sp>
 where
     Tick: crate::TickStream,
     F: crate::JobHandler<M>,
     F::Data: DeserializeOwned,
     F::Context: Clone,
+    M: 'static,
+    Sp: crate::JobSpawner,
 {
     fn subscribe(
         self,
         listener: &mut Listener,
-    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M> {
+    ) -> crate::Worker<futures::stream::Select<Tick, Subscribe>, BackEnd<F::Data>, F, M, Sp> {
         let backend = self.backend_ref();
         let subscribe = listener.subscribe(backend.queue_name.clone());
 
@@ -373,12 +373,7 @@ where
         listener: &mut Listener,
         duration: std::time::Duration,
         count: usize,
-    ) -> crate::Worker<
-        Throttle<futures::stream::Select<Tick, Subscribe>, Ticker>,
-        BackEnd<F::Data>,
-        F,
-        M,
-    > {
+    ) -> crate::Worker<ThrottleTick<Tick>, BackEnd<F::Data>, F, M, Sp> {
         let backend = self.backend_ref();
         let subscribe = listener.subscribe(backend.queue_name.clone());
 
