@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use tasuki::{
-    BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
+    BackEnd, Client, InsertJob, JobData, JobResult, TokioSpawner, WorkerBuilder, WorkerContext,
     WorkerWithListenerExt,
 };
 
@@ -23,6 +23,7 @@ async fn main() {
     let worker = WorkerBuilder::new_with_tick(futures::stream::pending())
         .concurrent(16)
         .handler(job_handler)
+        .job_spawner(TokioSpawner)
         .build(backend);
 
     let worker = WorkerWithListenerExt::subscribe_with_throttle(

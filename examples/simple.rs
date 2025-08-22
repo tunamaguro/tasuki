@@ -1,6 +1,6 @@
 use pin_project_lite::pin_project;
 use tasuki::{
-    BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
+    BackEnd, Client, InsertJob, JobData, JobResult, TokioSpawner, WorkerBuilder, WorkerContext,
     worker::JobSpawner,
 };
 
@@ -61,50 +61,5 @@ async fn job_handler(
     match handle.await {
         Ok(_) => JobResult::Cancel,
         Err(_) => JobResult::Retry(None),
-    }
-}
-
-pub struct TokioSpawner;
-
-pin_project! {
-    pub struct TokioJoinHandle{
-        #[pin]
-        handle: tokio::task::JoinHandle<()>
-    }
-}
-
-impl Future for TokioJoinHandle {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-        match this.handle.poll(cx) {
-            std::task::Poll::Ready(result) => {
-                if let Err(error) = result {
-                    tracing::error!(error = %error, "job panic happened");
-                };
-                std::task::Poll::Ready(())
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
-impl JobSpawner for TokioSpawner {
-    type JobHandle<Fut>
-        = TokioJoinHandle
-    where
-        Fut: Future<Output = ()> + Send + 'static;
-
-    fn spawn<Fut>(fut: Fut) -> Self::JobHandle<Fut>
-    where
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        TokioJoinHandle {
-            handle: tokio::spawn(fut),
-        }
     }
 }

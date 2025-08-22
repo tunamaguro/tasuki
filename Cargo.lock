@@ -1389,6 +1389,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "pin-project-lite",
+ "tokio",
  "tracing",
  "trait-variant",
 ]
