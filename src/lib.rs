@@ -151,31 +151,59 @@ pub trait TickStream: Stream<Item = ()> + Send {}
 
 impl<St> TickStream for St where St: Stream<Item = ()> + Send {}
 
-pub struct Worker<Tick, Poller, F, M>
+pub trait JobSpawner {
+    type JobHandle<Fut>: Future<Output = ()> + Send + 'static
+    where
+        Fut: Future<Output = ()> + Send + 'static;
+    fn spawn<Fut>(fut: Fut) -> Self::JobHandle<Fut>
+    where
+        Fut: Future<Output = ()> + Send + 'static;
+}
+
+pub struct InlineSpawner;
+
+impl JobSpawner for InlineSpawner {
+    type JobHandle<Fut>
+        = Fut
+    where
+        Fut: Future<Output = ()> + Send + 'static;
+    fn spawn<Fut>(fut: Fut) -> Self::JobHandle<Fut>
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        fut
+    }
+}
+
+pub struct Worker<Tick, Poller, F, M, Sp>
 where
     Tick: TickStream,
     F: JobHandler<M>,
     Poller: BackEndPoller<Data = F::Data>,
+    Sp: JobSpawner,
 {
     tick: Tick,
     poller: Poller,
     handler: F,
     context: F::Context,
     concurrent: usize,
+    marker: std::marker::PhantomData<fn() -> Sp>,
 }
 
-impl<Tick, Poller, F, M> Worker<Tick, Poller, F, M>
+impl<Tick, Poller, F, M, Sp> Worker<Tick, Poller, F, M, Sp>
 where
     Tick: TickStream,
     F: JobHandler<M>,
     F::Context: Clone,
-    Poller: BackEndPoller<Data = F::Data>,
+    M: 'static,
+    Poller: BackEndPoller<Data = F::Data> + 'static,
+    Sp: JobSpawner,
 {
     pub fn backend_ref(&self) -> &Poller {
         &self.poller
     }
 
-    pub fn modify_stream<ModFn, Tick2>(self, func: ModFn) -> Worker<Tick2, Poller, F, M>
+    pub fn modify_stream<ModFn, Tick2>(self, func: ModFn) -> Worker<Tick2, Poller, F, M, Sp>
     where
         ModFn: FnOnce(Tick) -> Tick2,
         Tick2: TickStream,
@@ -186,6 +214,7 @@ where
             handler,
             context,
             concurrent,
+            marker,
         } = self;
 
         let tick2 = func(tick);
@@ -196,13 +225,14 @@ where
             handler,
             context,
             concurrent,
+            marker,
         }
     }
 
     pub fn with_graceful_shutdown<Signal>(
         self,
         signal: Signal,
-    ) -> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
+    ) -> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal, Sp>
     where
         Signal: Future<Output = ()> + Send,
     {
@@ -212,6 +242,7 @@ where
             handler,
             context,
             concurrent,
+            marker: _,
         } = self;
         WorkerWithGracefulShutdown {
             tick,
@@ -220,11 +251,12 @@ where
             context,
             concurrent,
             signal,
+            marker: std::marker::PhantomData,
         }
     }
 
     pub fn run(self) -> impl Future<Output = ()> + Send {
-        run_worker(
+        run_worker::<_, _, _, _, _, Sp>(
             self.tick,
             self.handler,
             self.context,
@@ -235,12 +267,13 @@ where
     }
 }
 
-pub struct WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
+pub struct WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal, Sp>
 where
     Tick: TickStream,
     F: JobHandler<M>,
     Poller: BackEndPoller<Data = F::Data>,
     Signal: Future<Output = ()> + Send,
+    Sp: JobSpawner,
 {
     tick: Tick,
     poller: Poller,
@@ -248,18 +281,21 @@ where
     context: F::Context,
     concurrent: usize,
     signal: Signal,
+    marker: std::marker::PhantomData<fn() -> Sp>,
 }
 
-impl<Tick, Poller, F, M, Signal> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal>
+impl<Tick, Poller, F, M, Signal, Sp> WorkerWithGracefulShutdown<Tick, Poller, F, M, Signal, Sp>
 where
     Tick: TickStream,
     F: JobHandler<M>,
     F::Context: Clone,
-    Poller: BackEndPoller<Data = F::Data>,
+    M: 'static,
+    Poller: BackEndPoller<Data = F::Data> + 'static,
     Signal: Future<Output = ()> + Send,
+    Sp: JobSpawner,
 {
     pub fn run(self) -> impl Future<Output = ()> + Send {
-        run_worker(
+        run_worker::<_, _, _, _, _, Sp>(
             self.tick,
             self.handler,
             self.context,
@@ -270,7 +306,7 @@ where
     }
 }
 
-async fn run_worker<Tick, Poller, F, M, Signal>(
+async fn run_worker<Tick, Poller, F, M, Signal, Sp>(
     tick: Tick,
     handler: F,
     worker_context: F::Context,
@@ -281,13 +317,14 @@ async fn run_worker<Tick, Poller, F, M, Signal>(
     Tick: TickStream,
     F: JobHandler<M>,
     F::Context: Clone,
-    Poller: BackEndPoller<Data = F::Data>,
+    M: 'static,
+    Poller: BackEndPoller<Data = F::Data> + 'static,
     Signal: Future + Send,
+    Sp: JobSpawner,
 {
     let mut tick = tick.boxed().fuse();
     let mut tasks = futures::stream::FuturesUnordered::new();
     let mut signal = signal.boxed().fuse();
-
     loop {
         futures::select! {
             tick_val = tick.next() => {
@@ -304,7 +341,7 @@ async fn run_worker<Tick, Poller, F, M, Signal>(
                     match job {
                         Ok(job) => {
                             let fut = handle_one_job::<F,M,Poller>(job,handler.clone(),worker_context.clone());
-                            tasks.push(fut);
+                            tasks.push(<Sp as JobSpawner>::spawn(fut));
                         },
                         Err(error) => {
                             tracing::error!(error = %error, "Failed to fetch job");
@@ -364,20 +401,20 @@ async fn handle_one_job<F, M, Poller>(
     };
 }
 
-pub struct WorkerBuilder<Tick = (), Handler = (), M = (), Ctx = ()> {
+pub struct WorkerBuilder<Tick = (), Handler = (), M = (), Ctx = (), Sp = InlineSpawner> {
     tick: Tick,
     concurrent: usize,
     handler: Handler,
     context: Ctx,
-    marker: std::marker::PhantomData<fn() -> M>,
+    marker: std::marker::PhantomData<fn() -> (M, Sp)>,
 }
 
-impl WorkerBuilder<(), (), (), ()> {
-    pub fn new(interval: std::time::Duration) -> WorkerBuilder<Ticker, (), (), ()> {
+impl WorkerBuilder {
+    pub fn new(interval: std::time::Duration) -> WorkerBuilder<Ticker, (), (), (), InlineSpawner> {
         Self::new_with_tick(Ticker::new(interval))
     }
 
-    pub fn new_with_tick<Tick>(tick: Tick) -> WorkerBuilder<Tick, (), (), ()> {
+    pub fn new_with_tick<Tick>(tick: Tick) -> WorkerBuilder<Tick, (), (), (), InlineSpawner> {
         WorkerBuilder {
             tick,
             concurrent: 4,
@@ -388,7 +425,7 @@ impl WorkerBuilder<(), (), (), ()> {
     }
 }
 
-impl<Tick, Handler, M, Ctx> WorkerBuilder<Tick, Handler, M, Ctx> {
+impl<Tick, Handler, M, Ctx, Sp> WorkerBuilder<Tick, Handler, M, Ctx, Sp> {
     pub fn concurrent(self, concurrent: usize) -> Self {
         let Self {
             tick,
@@ -407,8 +444,8 @@ impl<Tick, Handler, M, Ctx> WorkerBuilder<Tick, Handler, M, Ctx> {
     }
 }
 
-impl<Tick, Ctx> WorkerBuilder<Tick, (), (), Ctx> {
-    pub fn handler<F, M>(self, handler: F) -> WorkerBuilder<Tick, F, M, Ctx>
+impl<Tick, Ctx, Sp> WorkerBuilder<Tick, (), (), Ctx, Sp> {
+    pub fn handler<F, M>(self, handler: F) -> WorkerBuilder<Tick, F, M, Ctx, Sp>
     where
         F: JobHandler<M>,
     {
@@ -429,8 +466,8 @@ impl<Tick, Ctx> WorkerBuilder<Tick, (), (), Ctx> {
     }
 }
 
-impl<Tick, Handler, M> WorkerBuilder<Tick, Handler, M, ()> {
-    pub fn context<Ctx>(self, context: Ctx) -> WorkerBuilder<Tick, Handler, M, Ctx>
+impl<Tick, Handler, M, Sp> WorkerBuilder<Tick, Handler, M, (), Sp> {
+    pub fn context<Ctx>(self, context: Ctx) -> WorkerBuilder<Tick, Handler, M, Ctx, Sp>
     where
         Ctx: Clone + Send,
     {
@@ -450,13 +487,35 @@ impl<Tick, Handler, M> WorkerBuilder<Tick, Handler, M, ()> {
         }
     }
 }
+impl<Tick, Handler, M, Ctx, Sp> WorkerBuilder<Tick, Handler, M, Ctx, Sp> {
+    pub fn job_spawner<Sp2>(self, _spawner: Sp2) -> WorkerBuilder<Tick, Handler, M, Ctx, Sp2>
+    where
+        Sp2: JobSpawner,
+    {
+        let Self {
+            tick,
+            concurrent,
+            handler,
+            marker: _,
+            context,
+        } = self;
+        WorkerBuilder {
+            tick,
+            concurrent,
+            handler,
+            marker: std::marker::PhantomData,
+            context,
+        }
+    }
+}
 
-impl<Tick, Handler, M> WorkerBuilder<Tick, Handler, M, Handler::Context>
+impl<Tick, Handler, M, Sp> WorkerBuilder<Tick, Handler, M, Handler::Context, Sp>
 where
     Tick: TickStream,
     Handler: JobHandler<M>,
+    Sp: JobSpawner,
 {
-    pub fn build<BackEnd>(self, backend: BackEnd) -> Worker<Tick, BackEnd, Handler, M>
+    pub fn build<BackEnd>(self, backend: BackEnd) -> Worker<Tick, BackEnd, Handler, M, Sp>
     where
         BackEnd: BackEndPoller<Data = Handler::Data>,
     {
@@ -473,6 +532,7 @@ where
             handler,
             context,
             concurrent,
+            marker: std::marker::PhantomData,
         }
     }
 }
