@@ -1,5 +1,9 @@
 use pin_project_lite::pin_project;
-use tasuki::{BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext};
+use tasuki_core::{
+    JobData, JobResult, WorkerContext,
+    worker::{JobSpawner, WorkerBuilder},
+};
+use tasuki_sqlx::{BackEnd, Client, InsertJob};
 
 #[tokio::main]
 async fn main() {
@@ -90,7 +94,7 @@ impl Future for TokioJoinHandle {
     }
 }
 
-impl tasuki::JobSpawner for TokioSpawner {
+impl JobSpawner for TokioSpawner {
     type JobHandle<Fut>
         = TokioJoinHandle
     where

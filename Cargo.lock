@@ -249,6 +249,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "examples"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "pin-project-lite",
+ "serde",
+ "sqlx",
+ "tasuki-core",
+ "tasuki-sqlx",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1366,21 +1383,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "tasuki"
+name = "tasuki-core"
 version = "0.1.0"
 dependencies = [
  "futures",
  "futures-timer",
  "pin-project-lite",
+ "tracing",
+ "trait-variant",
+]
+
+[[package]]
+name = "tasuki-sqlx"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "pin-project-lite",
  "serde",
  "serde_json",
  "sqlx",
- "tokio",
- "tokio-stream",
- "tokio-util",
+ "tasuki-core",
  "tracing",
- "tracing-subscriber",
- "trait-variant",
 ]
 
 [[package]]

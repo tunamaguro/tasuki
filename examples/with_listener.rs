@@ -1,8 +1,6 @@
 use futures::FutureExt;
-use tasuki::{
-    BackEnd, Client, InsertJob, JobData, JobResult, WorkerBuilder, WorkerContext,
-    worker::WorkerWithListenerExt,
-};
+use tasuki_core::{JobData, JobResult, WorkerContext, worker::WorkerBuilder};
+use tasuki_sqlx::{BackEnd, Client, InsertJob, WorkerWithListenerExt};
 
 #[tokio::main]
 async fn main() {
