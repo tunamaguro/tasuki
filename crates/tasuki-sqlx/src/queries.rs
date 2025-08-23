@@ -210,7 +210,10 @@ impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a
     }
 }
 #[derive(sqlx::FromRow)]
-pub struct HeartBeatJobRow {}
+pub struct HeartBeatJobRow {
+    #[sqlx(rename = "status")]
+    pub status: TasukiJobStatus,
+}
 pub struct HeartBeatJob<'a> {
     lease_interval: &'a sqlx::postgres::types::PgInterval,
     id: sqlx::types::Uuid,
@@ -220,10 +223,15 @@ impl<'a> HeartBeatJob<'a> {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET
-  lease_expires_at = clock_timestamp() + $1::INTERVAL
+  lease_expires_at = CASE
+    WHEN j.status = 'running'::tasuki_job_status
+      THEN clock_timestamp() + $1::INTERVAL
+    ELSE j.lease_expires_at
+  END
 WHERE
   id = $2
-  AND lease_token = $3";
+  AND lease_token = $3
+RETURNING j.status";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -237,23 +245,30 @@ WHERE
             .bind(self.id)
             .bind(self.lease_token)
     }
-    pub fn execute<'b, A>(
+    pub fn query_one<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> impl Future<Output = Result<HeartBeatJobRow, sqlx::Error>> + Send + 'a
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
         async move {
             let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.lease_interval)
-                .bind(self.id)
-                .bind(self.lease_token)
-                .execute(&mut *conn)
-                .await
+            let val = self.query_as().fetch_one(&mut *conn).await?;
+            Ok(val)
+        }
+    }
+    pub fn query_opt<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<Option<HeartBeatJobRow>, sqlx::Error>> + Send + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            let val = self.query_as().fetch_optional(&mut *conn).await?;
+            Ok(val)
         }
     }
 }
@@ -337,8 +352,7 @@ impl CompleteJob {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET 
-  status = 'completed'::tasuki_job_status,
-  lease_expires_at = NULL
+  status = 'completed'::tasuki_job_status
 WHERE
   id = $1
   AND lease_token = $2";
@@ -427,8 +441,7 @@ impl CancelJob {
     pub const QUERY: &'static str = r"UPDATE
   tasuki_job j
 SET
-  status = 'canceled'::tasuki_job_status,
-  lease_expires_at = NULL
+  status = 'canceled'::tasuki_job_status
 WHERE
   id = $1
   AND lease_token = $2";
@@ -1016,6 +1029,74 @@ impl<'a> AddJobNotifyBuilder<'a, (&'a str, &'a str)> {
             channel_name,
             queue_name,
         }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct CancelJobByIdRow {}
+pub struct CancelJobById {
+    id: sqlx::types::Uuid,
+}
+impl CancelJobById {
+    pub const QUERY: &'static str = r"UPDATE
+  tasuki_job j
+SET 
+  status = 'canceled'::tasuki_job_status
+WHERE
+  id = $1";
+    pub fn query_as<'a>(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        CancelJobByIdRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, CancelJobByIdRow>(Self::QUERY).bind(self.id)
+    }
+    pub fn execute<'a, 'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
+    + Send
+    + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            sqlx::query(Self::QUERY)
+                .bind(self.id)
+                .execute(&mut *conn)
+                .await
+        }
+    }
+}
+impl CancelJobById {
+    pub const fn builder() -> CancelJobByIdBuilder<'static, ((),)> {
+        CancelJobByIdBuilder {
+            fields: ((),),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct CancelJobByIdBuilder<'a, Fields = ((),)> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> CancelJobByIdBuilder<'a, ((),)> {
+    pub fn id(self, id: sqlx::types::Uuid) -> CancelJobByIdBuilder<'a, (sqlx::types::Uuid,)> {
+        let ((),) = self.fields;
+        let _phantom = self._phantom;
+        CancelJobByIdBuilder {
+            fields: (id,),
+            _phantom,
+        }
+    }
+}
+impl<'a> CancelJobByIdBuilder<'a, (sqlx::types::Uuid,)> {
+    pub const fn build(self) -> CancelJobById {
+        let (id,) = self.fields;
+        CancelJobById { id }
     }
 }
 #[derive(sqlx::FromRow)]

@@ -4,6 +4,7 @@ use pin_project_lite::pin_project;
 use serde::{Deserialize, de::DeserializeOwned};
 use tasuki_core::{
     BackEndContext, BackEndDriver, BackEndPoller, Job, JobHandler, Worker,
+    backend::Heartbeat,
     utils::{Throttle, Ticker},
     worker::{JobSpawner, TickStream},
 };
@@ -81,6 +82,23 @@ impl std::fmt::Display for LostLeaseError {
 
 impl std::error::Error for LostLeaseError {}
 
+fn status_to_str(status: queries::TasukiJobStatus) -> &'static str {
+    match status {
+        queries::TasukiJobStatus::Pending => "pending",
+        queries::TasukiJobStatus::Running => "running",
+        queries::TasukiJobStatus::Completed => "completed",
+        queries::TasukiJobStatus::Failed => "failed",
+        queries::TasukiJobStatus::Canceled => "canceled",
+    }
+}
+
+/// Exponential backoff with cap
+fn error_backoff(retries: u32) -> std::time::Duration {
+    let pow = 2 << retries.max(5);
+    let backoff = 100u64.saturating_mul(pow); // 100,200,400,800
+    std::time::Duration::from_millis(backoff)
+}
+
 #[derive(Debug)]
 pub struct OutTxContext {
     id: sqlx::types::Uuid,
@@ -92,25 +110,50 @@ pub struct OutTxContext {
 
 impl BackEndContext for OutTxContext {
     type Driver = PostgresDriver;
-    fn heartbeat_interval(&mut self) -> std::time::Duration {
-        self.interval
-    }
-    async fn heartbeat(&mut self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let res = queries::HeartBeatJob::builder()
-            .lease_interval(&self.lease_interval)
-            .id(self.id)
-            .lease_token(Some(self.lease_token))
-            .build()
-            .execute(&self.pool)
-            .await?;
 
-        if res.rows_affected() == 0 {
-            return Err(Error {
-                kind: ErrorKind::LostLease,
-                inner: Box::new(LostLeaseError),
-            });
+    async fn heartbeat(&mut self) -> Heartbeat {
+        let interval = self.interval / 3;
+        let mut retry_count = 0;
+
+        loop {
+            let res = queries::HeartBeatJob::builder()
+                .lease_interval(&self.lease_interval)
+                .id(self.id)
+                .lease_token(Some(self.lease_token))
+                .build()
+                .query_opt(&self.pool)
+                .await;
+
+            match res {
+                Ok(Some(row)) => {
+                    // Successful round-trip resets backoff
+                    match row.status {
+                        queries::TasukiJobStatus::Running => {
+                            retry_count = 0;
+                            tokio::time::sleep(interval).await;
+                        }
+                        queries::TasukiJobStatus::Canceled => {
+                            tracing::info!(job_id = %self.id, "job canceled");
+                            return Heartbeat::Stop;
+                        }
+                        other => {
+                            tracing::error!(job_id = %self.id, status = status_to_str(other), "unexpected status. expected 'running'");
+                            return Heartbeat::Stop;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::error!(job_id = %self.id, lease_token = %self.lease_token, "lost job lease");
+                    return Heartbeat::Stop;
+                }
+                Err(error) => {
+                    retry_count += 1;
+                    tracing::warn!(job_id = %self.id, error = %error, retry_count, "cannot heartbeat job; backing off");
+                    let backoff = error_backoff(retry_count);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
         }
-        Ok(())
     }
     async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
         let res = queries::CompleteJob::builder()
