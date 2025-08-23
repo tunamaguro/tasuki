@@ -4,6 +4,7 @@ use pin_project_lite::pin_project;
 use serde::{Deserialize, de::DeserializeOwned};
 use tasuki_core::{
     BackEndContext, BackEndDriver, BackEndPoller, Job, JobHandler, Worker,
+    backend::Heartbeat,
     utils::{Throttle, Ticker},
     worker::{JobSpawner, TickStream},
 };
@@ -92,25 +93,32 @@ pub struct OutTxContext {
 
 impl BackEndContext for OutTxContext {
     type Driver = PostgresDriver;
-    fn heartbeat_interval(&mut self) -> std::time::Duration {
-        self.interval
-    }
-    async fn heartbeat(&mut self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let res = queries::HeartBeatJob::builder()
-            .lease_interval(&self.lease_interval)
-            .id(self.id)
-            .lease_token(Some(self.lease_token))
-            .build()
-            .execute(&self.pool)
-            .await?;
 
-        if res.rows_affected() == 0 {
-            return Err(Error {
-                kind: ErrorKind::LostLease,
-                inner: Box::new(LostLeaseError),
-            });
+    async fn heartbeat(&mut self) -> Heartbeat {
+        loop {
+            let res = queries::HeartBeatJob::builder()
+                .lease_interval(&self.lease_interval)
+                .id(self.id)
+                .lease_token(Some(self.lease_token))
+                .build()
+                .execute(&self.pool)
+                .await;
+
+            let res = match res {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::error!(error = %error, "cannot heartbeat job");
+                    continue;
+                }
+            };
+
+            if res.rows_affected() == 0 {
+                tracing::error!("lost job lease");
+                return Heartbeat::Stop;
+            }
+
+            tokio::time::sleep(self.interval).await;
         }
-        Ok(())
     }
     async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
         let res = queries::CompleteJob::builder()

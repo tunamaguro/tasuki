@@ -1,27 +1,25 @@
-//! Backend-facing traits: lease jobs, heartbeat, and persist outcomes.
-//!
-//! Small surface, strong separation: the worker drives; the backend stores.
-//!
-//! Why:
-//! - Backend owns lease semantics and heartbeat cadence (storage knows best).
-//! - Finalization methods consume `self` to forbid double-commit by type.
-//! - Polling yields per-job results to avoid head-of-line blocking on errors.
 mod tmp {
     /// Backend marker carrying the backend-specific error type.
     pub trait BackEndDriver: Send {
         type Error: std::error::Error + Send;
     }
 
+    /// Heartbeat result
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Heartbeat {
+        /// continue job
+        Continue,
+        /// stop job. No finalization
+        Stop,
+    }
+
     /// Per-job context for heartbeats and finalization.
-    ///
-    /// Why: scope the authority to update a job to a single handle.
     #[trait_variant::make(BackEndContext: Send)]
     pub trait LocalBackEndContext {
         type Driver: BackEndDriver;
+
         #[allow(unused)]
-        fn heartbeat_interval(&mut self) -> std::time::Duration;
-        #[allow(unused)]
-        async fn heartbeat(&mut self) -> Result<(), <Self::Driver as BackEndDriver>::Error>;
+        async fn heartbeat(&mut self) -> Heartbeat;
         #[allow(unused)]
         async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error>;
         #[allow(unused)]
@@ -65,4 +63,4 @@ mod tmp {
     }
 }
 
-pub use tmp::{BackEndContext, BackEndDriver, BackEndPoller, Job};
+pub use tmp::{BackEndContext, BackEndDriver, BackEndPoller, Heartbeat, Job};
