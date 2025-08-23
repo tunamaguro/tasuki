@@ -78,16 +78,16 @@ WHERE
 -- name: InsertJobOne :exec
 INSERT INTO
   tasuki_job
-  (max_attempts, job_data, queue_name)
+  (max_attempts, job_data, queue_name, scheduled_at)
 VALUES
-  ($1, $2, $3);
+  ($1, $2, $3, clock_timestamp() + sqlc.arg(interval)::INTERVAL);
 
 -- name: InsertJobMany :copyfrom
 INSERT INTO
   tasuki_job
-  (max_attempts, job_data, queue_name)
+  (max_attempts, job_data, queue_name,scheduled_at)
 VALUES
-  ($1, $2, $3);
+  ($1, $2, $3, $4);
 
 -- name: AddJobNotify :exec
 SELECT pg_notify(

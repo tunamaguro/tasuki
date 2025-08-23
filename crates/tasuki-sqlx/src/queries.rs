@@ -649,13 +649,14 @@ pub struct InsertJobOne<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
     queue_name: &'a str,
+    interval: &'a sqlx::postgres::types::PgInterval,
 }
 impl<'a> InsertJobOne<'a> {
     pub const QUERY: &'static str = r"INSERT INTO
   tasuki_job
-  (max_attempts, job_data, queue_name)
+  (max_attempts, job_data, queue_name, scheduled_at)
 VALUES
-  ($1, $2, $3)";
+  ($1, $2, $3, clock_timestamp() + $4::INTERVAL)";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -668,6 +669,7 @@ VALUES
             .bind(self.max_attempts)
             .bind(self.job_data)
             .bind(self.queue_name)
+            .bind(self.interval)
     }
     pub fn execute<'b, A>(
         &'a self,
@@ -684,69 +686,108 @@ VALUES
                 .bind(self.max_attempts)
                 .bind(self.job_data)
                 .bind(self.queue_name)
+                .bind(self.interval)
                 .execute(&mut *conn)
                 .await
         }
     }
 }
 impl<'a> InsertJobOne<'a> {
-    pub const fn builder() -> InsertJobOneBuilder<'a, ((), (), ())> {
+    pub const fn builder() -> InsertJobOneBuilder<'a, ((), (), (), ())> {
         InsertJobOneBuilder {
-            fields: ((), (), ()),
+            fields: ((), (), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct InsertJobOneBuilder<'a, Fields = ((), (), ())> {
+pub struct InsertJobOneBuilder<'a, Fields = ((), (), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, JobData, QueueName> InsertJobOneBuilder<'a, ((), JobData, QueueName)> {
+impl<'a, JobData, QueueName, Interval> InsertJobOneBuilder<'a, ((), JobData, QueueName, Interval)> {
     pub fn max_attempts(
         self,
         max_attempts: i32,
-    ) -> InsertJobOneBuilder<'a, (i32, JobData, QueueName)> {
-        let ((), job_data, queue_name) = self.fields;
+    ) -> InsertJobOneBuilder<'a, (i32, JobData, QueueName, Interval)> {
+        let ((), job_data, queue_name, interval) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, interval),
             _phantom,
         }
     }
 }
-impl<'a, MaxAttempts, QueueName> InsertJobOneBuilder<'a, (MaxAttempts, (), QueueName)> {
+impl<'a, MaxAttempts, QueueName, Interval>
+    InsertJobOneBuilder<'a, (MaxAttempts, (), QueueName, Interval)>
+{
     pub fn job_data(
         self,
         job_data: &'a serde_json::Value,
-    ) -> InsertJobOneBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName)> {
-        let (max_attempts, (), queue_name) = self.fields;
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName, Interval)> {
+        let (max_attempts, (), queue_name, interval) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, interval),
             _phantom,
         }
     }
 }
-impl<'a, MaxAttempts, JobData> InsertJobOneBuilder<'a, (MaxAttempts, JobData, ())> {
+impl<'a, MaxAttempts, JobData, Interval>
+    InsertJobOneBuilder<'a, (MaxAttempts, JobData, (), Interval)>
+{
     pub fn queue_name(
         self,
         queue_name: &'a str,
-    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, &'a str)> {
-        let (max_attempts, job_data, ()) = self.fields;
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, &'a str, Interval)> {
+        let (max_attempts, job_data, (), interval) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, interval),
             _phantom,
         }
     }
 }
-impl<'a> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value, &'a str)> {
+impl<'a, MaxAttempts, JobData, QueueName>
+    InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, ())>
+{
+    pub fn interval(
+        self,
+        interval: &'a sqlx::postgres::types::PgInterval,
+    ) -> InsertJobOneBuilder<
+        'a,
+        (
+            MaxAttempts,
+            JobData,
+            QueueName,
+            &'a sqlx::postgres::types::PgInterval,
+        ),
+    > {
+        let (max_attempts, job_data, queue_name, ()) = self.fields;
+        let _phantom = self._phantom;
+        InsertJobOneBuilder {
+            fields: (max_attempts, job_data, queue_name, interval),
+            _phantom,
+        }
+    }
+}
+impl<'a>
+    InsertJobOneBuilder<
+        'a,
+        (
+            i32,
+            &'a serde_json::Value,
+            &'a str,
+            &'a sqlx::postgres::types::PgInterval,
+        ),
+    >
+{
     pub const fn build(self) -> InsertJobOne<'a> {
-        let (max_attempts, job_data, queue_name) = self.fields;
+        let (max_attempts, job_data, queue_name, interval) = self.fields;
         InsertJobOne {
             max_attempts,
             job_data,
             queue_name,
+            interval,
         }
     }
 }
@@ -756,10 +797,10 @@ pub struct InsertJobMany<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
     queue_name: &'a str,
+    scheduled_at: crate::PgDateTime,
 }
 impl<'a> InsertJobMany<'a> {
-    pub const QUERY: &'static str =
-        r"COPY tasuki_job (max_attempts,job_data,queue_name) FROM STDIN (FORMAT BINARY)";
+    pub const QUERY: &'static str = r"COPY tasuki_job (max_attempts,job_data,queue_name,scheduled_at) FROM STDIN (FORMAT BINARY)";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -772,6 +813,7 @@ impl<'a> InsertJobMany<'a> {
             .bind(self.max_attempts)
             .bind(self.job_data)
             .bind(self.queue_name)
+            .bind(self.scheduled_at)
     }
     pub async fn copy_in<PgCopy>(
         conn: &PgCopy,
@@ -796,67 +838,91 @@ impl<'a> InsertJobMany<'a> {
         sink.add(&self.max_attempts).await?;
         sink.add(&self.job_data).await?;
         sink.add(&self.queue_name).await?;
+        sink.add(&self.scheduled_at).await?;
         Ok(())
     }
 }
 impl<'a> InsertJobMany<'a> {
-    pub const fn builder() -> InsertJobManyBuilder<'a, ((), (), ())> {
+    pub const fn builder() -> InsertJobManyBuilder<'a, ((), (), (), ())> {
         InsertJobManyBuilder {
-            fields: ((), (), ()),
+            fields: ((), (), (), ()),
             _phantom: std::marker::PhantomData,
         }
     }
 }
-pub struct InsertJobManyBuilder<'a, Fields = ((), (), ())> {
+pub struct InsertJobManyBuilder<'a, Fields = ((), (), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<'a, JobData, QueueName> InsertJobManyBuilder<'a, ((), JobData, QueueName)> {
+impl<'a, JobData, QueueName, ScheduledAt>
+    InsertJobManyBuilder<'a, ((), JobData, QueueName, ScheduledAt)>
+{
     pub fn max_attempts(
         self,
         max_attempts: i32,
-    ) -> InsertJobManyBuilder<'a, (i32, JobData, QueueName)> {
-        let ((), job_data, queue_name) = self.fields;
+    ) -> InsertJobManyBuilder<'a, (i32, JobData, QueueName, ScheduledAt)> {
+        let ((), job_data, queue_name, scheduled_at) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, scheduled_at),
             _phantom,
         }
     }
 }
-impl<'a, MaxAttempts, QueueName> InsertJobManyBuilder<'a, (MaxAttempts, (), QueueName)> {
+impl<'a, MaxAttempts, QueueName, ScheduledAt>
+    InsertJobManyBuilder<'a, (MaxAttempts, (), QueueName, ScheduledAt)>
+{
     pub fn job_data(
         self,
         job_data: &'a serde_json::Value,
-    ) -> InsertJobManyBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName)> {
-        let (max_attempts, (), queue_name) = self.fields;
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName, ScheduledAt)>
+    {
+        let (max_attempts, (), queue_name, scheduled_at) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, scheduled_at),
             _phantom,
         }
     }
 }
-impl<'a, MaxAttempts, JobData> InsertJobManyBuilder<'a, (MaxAttempts, JobData, ())> {
+impl<'a, MaxAttempts, JobData, ScheduledAt>
+    InsertJobManyBuilder<'a, (MaxAttempts, JobData, (), ScheduledAt)>
+{
     pub fn queue_name(
         self,
         queue_name: &'a str,
-    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, &'a str)> {
-        let (max_attempts, job_data, ()) = self.fields;
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, &'a str, ScheduledAt)> {
+        let (max_attempts, job_data, (), scheduled_at) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
-            fields: (max_attempts, job_data, queue_name),
+            fields: (max_attempts, job_data, queue_name, scheduled_at),
             _phantom,
         }
     }
 }
-impl<'a> InsertJobManyBuilder<'a, (i32, &'a serde_json::Value, &'a str)> {
+impl<'a, MaxAttempts, JobData, QueueName>
+    InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, ())>
+{
+    pub fn scheduled_at(
+        self,
+        scheduled_at: crate::PgDateTime,
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, crate::PgDateTime)> {
+        let (max_attempts, job_data, queue_name, ()) = self.fields;
+        let _phantom = self._phantom;
+        InsertJobManyBuilder {
+            fields: (max_attempts, job_data, queue_name, scheduled_at),
+            _phantom,
+        }
+    }
+}
+impl<'a> InsertJobManyBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::PgDateTime)> {
     pub const fn build(self) -> InsertJobMany<'a> {
-        let (max_attempts, job_data, queue_name) = self.fields;
+        let (max_attempts, job_data, queue_name, scheduled_at) = self.fields;
         InsertJobMany {
             max_attempts,
             job_data,
             queue_name,
+            scheduled_at,
         }
     }
 }

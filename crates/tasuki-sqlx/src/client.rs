@@ -12,6 +12,11 @@ use crate::queries;
 pub struct InsertJob<T> {
     data: T,
     max_attempts: u16,
+    /// Delay before the job becomes eligible for execution.
+    ///
+    /// Defaults to zero (immediate scheduling). If greater than zero, the job
+    /// will be scheduled at `now() + delay` in the database.
+    delay: std::time::Duration,
 }
 
 impl<T> InsertJob<T> {
@@ -23,6 +28,7 @@ impl<T> InsertJob<T> {
         Self {
             data,
             max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
+            delay: std::time::Duration::from_secs(0),
         }
     }
 
@@ -32,6 +38,11 @@ impl<T> InsertJob<T> {
             max_attempts,
             ..self
         }
+    }
+
+    /// Delay the job's execution by the provided duration.
+    pub fn delay(self, delay: std::time::Duration) -> Self {
+        Self { delay, ..self }
     }
 
     /// Extract the wrapped job payload.
@@ -149,9 +160,8 @@ where
 {
     /// Insert a job into the queue using the client's connection pool.
     pub async fn insert(&self, data: &InsertJob<T>) -> Result<(), Error> {
-        let mut tx = self.pool.begin().await?;
-        self.insert_tx(data, &mut tx).await?;
-        tx.commit().await?;
+        let mut conn = self.pool.acquire().await?;
+        self.insert_tx(data, &mut conn).await?;
 
         Ok(())
     }
@@ -171,10 +181,17 @@ where
 
             let mut conn = tx.acquire().await?;
 
+            let interval =
+                sqlx::postgres::types::PgInterval::try_from(data.delay).map_err(|e| Error {
+                    kind: ErrorKind::DataBase,
+                    inner: e,
+                })?;
+
             queries::InsertJobOne::builder()
                 .job_data(&value)
                 .max_attempts(data.max_attempts.into())
                 .queue_name(&self.queue_name)
+                .interval(&interval)
                 .build()
                 .execute(&mut *conn)
                 .await?;
@@ -229,19 +246,21 @@ where
         async move {
             let mut conn = tx.acquire().await?;
             {
+                let now = std::time::SystemTime::now();
                 let mut sink = queries::InsertJobMany::copy_in_tx(&mut conn).await?;
                 for job in data {
                     let value = serde_json::to_value(&job.data)?;
+                    let scheduled_at = crate::PgDateTime(now + job.delay);
                     queries::InsertJobMany::builder()
                         .job_data(&value)
                         .max_attempts(job.max_attempts.into())
                         .queue_name(&self.queue_name)
+                        .scheduled_at(scheduled_at)
                         .build()
                         .write(&mut sink)
                         .await
                         .map_err(|error| Error::new_database(error))?;
                 }
-
                 sink.finish()
                     .await
                     .map_err(|error| Error::new_database(error))?;
