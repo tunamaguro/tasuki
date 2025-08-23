@@ -1,6 +1,7 @@
 //! Client utilities for enqueuing jobs into the Tasuki queue.
 
 use serde::Serialize;
+use std::future::Future;
 
 use crate::queries;
 
@@ -160,8 +161,7 @@ where
 {
     /// Insert a job into the queue using the client's connection pool.
     pub async fn insert(&self, data: &InsertJob<T>) -> Result<(), Error> {
-        let mut conn = self.pool.acquire().await?;
-        self.insert_tx(data, &mut conn).await?;
+        self.insert_tx(data, &self.pool).await?;
 
         Ok(())
     }
@@ -273,6 +273,37 @@ where
                 .execute(&mut *conn)
                 .await?;
 
+            Ok(())
+        }
+    }
+
+    /// Cancel a job by `id` regardless of its status.
+    ///
+    /// This is intended for administrative use (no lease token required).
+    pub async fn cancel(&self, id: sqlx::types::Uuid) -> Result<(), Error> {
+        self.cancel_tx(id, &self.pool).await?;
+        Ok(())
+    }
+
+    /// Cancel a job using an existing transaction or connection (admin).
+    #[allow(clippy::manual_async_fn)]
+    pub fn cancel_tx<'a, 'c, A>(
+        &self,
+        id: sqlx::types::Uuid,
+        tx: A,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a
+    where
+        A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = tx.acquire().await?;
+            // Idempotent admin cancel: no error if job is already finalized
+            // (0 rows affected). It ensures job ends up in `canceled` state.
+            let _ = queries::CancelJobById::builder()
+                .id(id)
+                .build()
+                .execute(&mut *conn)
+                .await?;
             Ok(())
         }
     }

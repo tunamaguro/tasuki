@@ -26,6 +26,7 @@ WHERE
   )
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token;
 
+-- name: HeartBeatJob :one
 UPDATE 
   tasuki_job j
 SET
@@ -43,8 +44,7 @@ RETURNING j.status;
 UPDATE 
   tasuki_job j
 SET 
-  status = 'completed'::tasuki_job_status,
-  lease_expires_at = NULL
+  status = 'completed'::tasuki_job_status
 WHERE
   id = sqlc.arg(id)
   AND lease_token = sqlc.arg(lease_token);
@@ -53,8 +53,7 @@ WHERE
 UPDATE
   tasuki_job j
 SET
-  status = 'canceled'::tasuki_job_status,
-  lease_expires_at = NULL
+  status = 'canceled'::tasuki_job_status
 WHERE
   id = sqlc.arg(id)
   AND lease_token = sqlc.arg(lease_token);
@@ -98,6 +97,14 @@ SELECT pg_notify(
   sqlc.arg(channel_name)::TEXT,
   json_build_object('q', sqlc.arg(queue_name)::TEXT)::TEXT
 );
+
+-- name: CancelJobById :exec
+UPDATE
+  tasuki_job j
+SET 
+  status = 'canceled'::tasuki_job_status
+WHERE
+  id = sqlc.arg(id);
 
 -- name: RetryFailedByQueue :exec
 UPDATE tasuki_job j
