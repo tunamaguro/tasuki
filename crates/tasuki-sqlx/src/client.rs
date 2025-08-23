@@ -76,7 +76,7 @@ pub struct Error {
 impl Error {
     fn new_database(error: Box<dyn std::error::Error + Send + 'static>) -> Self {
         Error {
-            kind: ErrorKind::Encode,
+            kind: ErrorKind::DataBase,
             inner: error,
         }
     }
