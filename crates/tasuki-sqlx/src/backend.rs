@@ -147,7 +147,7 @@ impl BackEndContext for OutTxContext {
                     return Heartbeat::Stop;
                 }
                 Err(error) => {
-                    retry_count = retry_count + 1;
+                    retry_count += 1;
                     tracing::warn!(job_id = %self.id, error = %error, retry_count, "cannot heartbeat job; backing off");
                     let backoff = error_backoff(retry_count);
                     tokio::time::sleep(backoff).await;
