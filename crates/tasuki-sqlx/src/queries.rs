@@ -210,7 +210,10 @@ impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a
     }
 }
 #[derive(sqlx::FromRow)]
-pub struct HeartBeatJobRow {}
+pub struct HeartBeatJobRow {
+    #[sqlx(rename = "status")]
+    pub status: TasukiJobStatus,
+}
 pub struct HeartBeatJob<'a> {
     lease_interval: &'a sqlx::postgres::types::PgInterval,
     id: sqlx::types::Uuid,
@@ -223,7 +226,8 @@ SET
   lease_expires_at = clock_timestamp() + $1::INTERVAL
 WHERE
   id = $2
-  AND lease_token = $3";
+  AND lease_token = $3
+RETURNING j.status";
     pub fn query_as(
         &'a self,
     ) -> sqlx::query::QueryAs<
@@ -237,23 +241,30 @@ WHERE
             .bind(self.id)
             .bind(self.lease_token)
     }
-    pub fn execute<'b, A>(
+    pub fn query_one<'b, A>(
         &'a self,
         conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
+    ) -> impl Future<Output = Result<HeartBeatJobRow, sqlx::Error>> + Send + 'a
     where
         A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
     {
         async move {
             let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.lease_interval)
-                .bind(self.id)
-                .bind(self.lease_token)
-                .execute(&mut *conn)
-                .await
+            let val = self.query_as().fetch_one(&mut *conn).await?;
+            Ok(val)
+        }
+    }
+    pub fn query_opt<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<Option<HeartBeatJobRow>, sqlx::Error>> + Send + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            let val = self.query_as().fetch_optional(&mut *conn).await?;
+            Ok(val)
         }
     }
 }

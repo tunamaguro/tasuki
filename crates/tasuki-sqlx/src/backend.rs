@@ -82,6 +82,16 @@ impl std::fmt::Display for LostLeaseError {
 
 impl std::error::Error for LostLeaseError {}
 
+fn status_to_str(status: queries::TasukiJobStatus) -> &'static str {
+    match status {
+        queries::TasukiJobStatus::Pending => "pending",
+        queries::TasukiJobStatus::Running => "running",
+        queries::TasukiJobStatus::Completed => "completed",
+        queries::TasukiJobStatus::Failed => "failed",
+        queries::TasukiJobStatus::Canceled => "canceled",
+    }
+}
+
 #[derive(Debug)]
 pub struct OutTxContext {
     id: sqlx::types::Uuid,
@@ -101,7 +111,7 @@ impl BackEndContext for OutTxContext {
                 .id(self.id)
                 .lease_token(Some(self.lease_token))
                 .build()
-                .execute(&self.pool)
+                .query_opt(&self.pool)
                 .await;
 
             let res = match res {
@@ -112,11 +122,29 @@ impl BackEndContext for OutTxContext {
                 }
             };
 
-            if res.rows_affected() == 0 {
-                tracing::error!("lost job lease");
-                return Heartbeat::Stop;
-            }
+            let row = match res {
+                Some(row) => row,
+                None => {
+                    tracing::error!("lost job lease");
+                    return Heartbeat::Stop;
+                }
+            };
 
+            match row.status {
+                queries::TasukiJobStatus::Running => {}
+                queries::TasukiJobStatus::Canceled => {
+                    tracing::info!("job canceled");
+                    return Heartbeat::Stop;
+                }
+                _ => {
+                    tracing::error!(
+                        status = status_to_str(row.status),
+                        "unexpected status. expected 'running'"
+                    );
+                    return Heartbeat::Stop;
+                }
+            }
+            
             tokio::time::sleep(self.interval).await;
         }
     }
