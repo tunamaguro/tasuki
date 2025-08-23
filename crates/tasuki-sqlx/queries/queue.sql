@@ -85,7 +85,7 @@ VALUES
 -- name: InsertJobMany :copyfrom
 INSERT INTO
   tasuki_job
-  (max_attempts, job_data, queue_name,scheduled_at)
+  (max_attempts, job_data, queue_name, scheduled_at)
 VALUES
   ($1, $2, $3, $4);
 

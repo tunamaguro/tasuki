@@ -61,7 +61,7 @@ impl<T> From<T> for InsertJob<T> {
 /// Categories of errors that can occur when inserting a job.
 pub enum ErrorKind {
     /// An error was returned by the database layer.
-    DataBase,
+    Database,
     /// Serialization of the job data failed.
     Encode,
 }
@@ -76,7 +76,7 @@ pub struct Error {
 impl Error {
     fn new_database(error: Box<dyn std::error::Error + Send + 'static>) -> Self {
         Error {
-            kind: ErrorKind::DataBase,
+            kind: ErrorKind::Database,
             inner: error,
         }
     }
@@ -183,7 +183,7 @@ where
 
             let interval =
                 sqlx::postgres::types::PgInterval::try_from(data.delay).map_err(|e| Error {
-                    kind: ErrorKind::DataBase,
+                    kind: ErrorKind::Database,
                     inner: e,
                 })?;
 
