@@ -92,6 +92,13 @@ fn status_to_str(status: queries::TasukiJobStatus) -> &'static str {
     }
 }
 
+/// Exponential backoff with cap
+fn error_backoff(retries: u32) -> std::time::Duration {
+    let pow = 2 << retries.max(5);
+    let backoff = 100u64.saturating_mul(pow); // 100,200,400,800
+    std::time::Duration::from_millis(backoff)
+}
+
 #[derive(Debug)]
 pub struct OutTxContext {
     id: sqlx::types::Uuid,
@@ -105,6 +112,9 @@ impl BackEndContext for OutTxContext {
     type Driver = PostgresDriver;
 
     async fn heartbeat(&mut self) -> Heartbeat {
+        let interval = self.interval / 3;
+        let mut retry_count = 0;
+
         loop {
             let res = queries::HeartBeatJob::builder()
                 .lease_interval(&self.lease_interval)
@@ -114,38 +124,35 @@ impl BackEndContext for OutTxContext {
                 .query_opt(&self.pool)
                 .await;
 
-            let res = match res {
-                Ok(row) => row,
+            match res {
+                Ok(Some(row)) => {
+                    // Successful round-trip resets backoff
+                    match row.status {
+                        queries::TasukiJobStatus::Running => {
+                            retry_count = 0;
+                            tokio::time::sleep(interval).await;
+                        }
+                        queries::TasukiJobStatus::Canceled => {
+                            tracing::info!(job_id = %self.id, "job canceled");
+                            return Heartbeat::Stop;
+                        }
+                        other => {
+                            tracing::error!(job_id = %self.id, status = status_to_str(other), "unexpected status. expected 'running'");
+                            return Heartbeat::Stop;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::error!(job_id = %self.id, lease_token = %self.lease_token, "lost job lease");
+                    return Heartbeat::Stop;
+                }
                 Err(error) => {
-                    tracing::error!(error = %error, "cannot heartbeat job");
-                    continue;
-                }
-            };
-
-            let row = match res {
-                Some(row) => row,
-                None => {
-                    tracing::error!("lost job lease");
-                    return Heartbeat::Stop;
-                }
-            };
-
-            match row.status {
-                queries::TasukiJobStatus::Running => {}
-                queries::TasukiJobStatus::Canceled => {
-                    tracing::info!("job canceled");
-                    return Heartbeat::Stop;
-                }
-                _ => {
-                    tracing::error!(
-                        status = status_to_str(row.status),
-                        "unexpected status. expected 'running'"
-                    );
-                    return Heartbeat::Stop;
+                    retry_count = retry_count + 1;
+                    tracing::warn!(job_id = %self.id, error = %error, retry_count, "cannot heartbeat job; backing off");
+                    let backoff = error_backoff(retry_count);
+                    tokio::time::sleep(backoff).await;
                 }
             }
-            
-            tokio::time::sleep(self.interval).await;
         }
     }
     async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {

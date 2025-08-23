@@ -223,7 +223,10 @@ impl<'a> HeartBeatJob<'a> {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET
-  lease_expires_at = clock_timestamp() + $1::INTERVAL
+  lease_expires_at = CASE
+    WHEN j.status = 'running'::tasuki_job_status THEN clock_timestamp() + $1::INTERVAL
+    ELSE j.lease_expires_at
+  END
 WHERE
   id = $2
   AND lease_token = $3

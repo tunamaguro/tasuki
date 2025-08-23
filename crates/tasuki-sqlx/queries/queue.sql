@@ -26,11 +26,14 @@ WHERE
   )
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token;
 
--- name: HeartBeatJob :one
 UPDATE 
   tasuki_job j
 SET
-  lease_expires_at = clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL
+  lease_expires_at = CASE
+    WHEN j.status = 'running'::tasuki_job_status
+      THEN clock_timestamp() + sqlc.arg(lease_interval)::INTERVAL
+    ELSE j.lease_expires_at
+  END
 WHERE
   id = sqlc.arg(id)
   AND lease_token = sqlc.arg(lease_token)
