@@ -1172,101 +1172,6 @@ impl<'a> RetryFailedByQueueBuilder<'a, (&'a str,)> {
     }
 }
 #[derive(sqlx::FromRow)]
-pub struct AggregateQueueStatAllRow {
-    #[sqlx(rename = "queue_name")]
-    pub queue_name: String,
-    #[sqlx(rename = "pending")]
-    pub pending: i64,
-    #[sqlx(rename = "running")]
-    pub running: i64,
-    #[sqlx(rename = "completed")]
-    pub completed: i64,
-    #[sqlx(rename = "failed")]
-    pub failed: i64,
-    #[sqlx(rename = "canceled")]
-    pub canceled: i64,
-}
-pub struct AggregateQueueStatAll;
-impl AggregateQueueStatAll {
-    pub const QUERY: &'static str = r"SELECT 
-  queue_name,
-  SUM(
-    CASE WHEN status = 'pending'
-      THEN 1
-      ELSE 0
-    END
-  ) AS pending,
-  SUM(
-    CASE WHEN status = 'running'
-      THEN 1
-      ELSE 0
-    END
-  ) AS running,
-  SUM(
-    CASE WHEN status = 'completed'
-      THEN 1
-      ELSE 0
-    END
-  ) AS completed,
-  SUM(
-    CASE WHEN status = 'failed'
-      THEN 1
-      ELSE 0
-    END
-  ) AS failed,
-  SUM(
-    CASE WHEN status = 'canceled'
-      THEN 1
-      ELSE 0
-    END
-  ) AS canceled
-FROM 
-  tasuki_job
-GROUP BY 
-  queue_name";
-    pub fn query_as<'a>(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        AggregateQueueStatAllRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, AggregateQueueStatAllRow>(Self::QUERY)
-    }
-    pub fn query_many<'a, 'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Vec<AggregateQueueStatAllRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
-    }
-}
-impl AggregateQueueStatAll {
-    pub const fn builder() -> AggregateQueueStatAllBuilder<'static, ()> {
-        AggregateQueueStatAllBuilder {
-            fields: (),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-pub struct AggregateQueueStatAllBuilder<'a, Fields = ()> {
-    fields: Fields,
-    _phantom: std::marker::PhantomData<&'a ()>,
-}
-impl<'a> AggregateQueueStatAllBuilder<'a, ()> {
-    pub const fn build(self) -> AggregateQueueStatAll {
-        let () = self.fields;
-        AggregateQueueStatAll {}
-    }
-}
-#[derive(sqlx::FromRow)]
 pub struct AggregateQueueStatRow {
     #[sqlx(rename = "pending")]
     pub pending: i64,
@@ -1381,5 +1286,91 @@ impl<'a> AggregateQueueStatBuilder<'a, (&'a str,)> {
     pub const fn build(self) -> AggregateQueueStat<'a> {
         let (queue_name,) = self.fields;
         AggregateQueueStat { queue_name }
+    }
+}
+#[derive(sqlx::FromRow)]
+pub struct CleanJobsRow {
+    #[sqlx(rename = "id")]
+    pub id: sqlx::types::Uuid,
+}
+pub struct CleanJobs<'a> {
+    job_status: TasukiJobStatus,
+    queue_name: &'a str,
+}
+impl<'a> CleanJobs<'a> {
+    pub const QUERY: &'static str = r"DELETE FROM
+  tasuki_job
+WHERE 
+  status = $1
+  AND queue_name = $2
+RETURNING id";
+    pub fn query_as(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        CleanJobsRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, CleanJobsRow>(Self::QUERY)
+            .bind(self.job_status)
+            .bind(self.queue_name)
+    }
+    pub fn query_many<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<Vec<CleanJobsRow>, sqlx::Error>> + Send + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            let vals = self.query_as().fetch_all(&mut *conn).await?;
+            Ok(vals)
+        }
+    }
+}
+impl<'a> CleanJobs<'a> {
+    pub const fn builder() -> CleanJobsBuilder<'a, ((), ())> {
+        CleanJobsBuilder {
+            fields: ((), ()),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct CleanJobsBuilder<'a, Fields = ((), ())> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a, QueueName> CleanJobsBuilder<'a, ((), QueueName)> {
+    pub fn job_status(
+        self,
+        job_status: TasukiJobStatus,
+    ) -> CleanJobsBuilder<'a, (TasukiJobStatus, QueueName)> {
+        let ((), queue_name) = self.fields;
+        let _phantom = self._phantom;
+        CleanJobsBuilder {
+            fields: (job_status, queue_name),
+            _phantom,
+        }
+    }
+}
+impl<'a, JobStatus> CleanJobsBuilder<'a, (JobStatus, ())> {
+    pub fn queue_name(self, queue_name: &'a str) -> CleanJobsBuilder<'a, (JobStatus, &'a str)> {
+        let (job_status, ()) = self.fields;
+        let _phantom = self._phantom;
+        CleanJobsBuilder {
+            fields: (job_status, queue_name),
+            _phantom,
+        }
+    }
+}
+impl<'a> CleanJobsBuilder<'a, (TasukiJobStatus, &'a str)> {
+    pub const fn build(self) -> CleanJobs<'a> {
+        let (job_status, queue_name) = self.fields;
+        CleanJobs {
+            job_status,
+            queue_name,
+        }
     }
 }
