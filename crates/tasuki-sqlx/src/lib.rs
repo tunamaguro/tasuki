@@ -8,7 +8,7 @@ pub mod backend;
 pub mod client;
 
 pub use backend::{BackEnd, Listener, WorkerWithListenerExt};
-pub use client::{Client, InsertJob};
+pub use client::{Client, InsertJob, QueueStats};
 
 const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
 const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";

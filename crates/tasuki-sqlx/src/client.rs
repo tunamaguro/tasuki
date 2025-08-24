@@ -153,6 +153,52 @@ impl<T> Client<T> {
             ..self
         }
     }
+
+    /// Aggregate job counts grouped by queue name across all queues.
+    ///
+    /// Returns one row per queue with counts by status.
+    pub async fn aggregate_status_all(&self) -> Result<Vec<QueueStats>, Error> {
+        let rows = queries::AggregateQueueStatAll::builder()
+            .build()
+            .query_many(&self.pool)
+            .await?;
+
+        let mapped = rows
+            .into_iter()
+            .map(|r| QueueStats {
+                queue_name: r.queue_name,
+                pending: r.pending,
+                running: r.running,
+                completed: r.completed,
+                failed: r.failed,
+                canceled: r.canceled,
+            })
+            .collect();
+
+        Ok(mapped)
+    }
+
+    /// Aggregate job counts for the client's queue name.
+    ///
+    /// Returns counts by status. If the queue has no rows yet, zeros are returned.
+    pub async fn aggregate_status(&self) -> Result<QueueStats, Error> {
+        let r = queries::AggregateQueueStat::builder()
+            .queue_name(self.queue_name.as_ref())
+            .build()
+            .query_one(&self.pool)
+            .await?;
+
+        let stats = QueueStats {
+            queue_name: self.queue_name.to_string(),
+            pending: r.pending,
+            running: r.running,
+            completed: r.completed,
+            failed: r.failed,
+            canceled: r.canceled,
+        };
+
+        Ok(stats)
+    }
 }
 
 impl<T> Client<T>
@@ -307,4 +353,15 @@ where
             Ok(())
         }
     }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone, PartialEq, Eq)]
+/// Aggregate counts of jobs by status for a queue.
+pub struct QueueStats {
+    pub queue_name: String,
+    pub pending: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub canceled: i64,
 }
