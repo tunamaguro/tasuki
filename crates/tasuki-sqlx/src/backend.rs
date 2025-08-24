@@ -92,11 +92,10 @@ fn status_to_str(status: queries::TasukiJobStatus) -> &'static str {
     }
 }
 
-/// Exponential backoff with cap
-fn error_backoff(retries: u32) -> std::time::Duration {
-    let pow = 2 << retries.max(5);
-    let backoff = 100u64.saturating_mul(pow); // 100,200,400,800
-    std::time::Duration::from_millis(backoff)
+fn exponential_backoff(base_delay: std::time::Duration, retries: u32) -> std::time::Duration {
+    let pow = 2u32.pow(retries);
+    let backoff = base_delay.saturating_mul(pow);
+    backoff
 }
 
 #[derive(Debug)]
@@ -149,7 +148,8 @@ impl BackEndContext for OutTxContext {
                 Err(error) => {
                     retry_count += 1;
                     tracing::warn!(job_id = %self.id, error = %error, retry_count, "cannot heartbeat job; backing off");
-                    let backoff = error_backoff(retry_count);
+                    const BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+                    let backoff = exponential_backoff(BACKOFF_BASE, retry_count).min(interval);
                     tokio::time::sleep(backoff).await;
                 }
             }
