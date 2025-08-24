@@ -94,8 +94,8 @@ fn status_to_str(status: queries::TasukiJobStatus) -> &'static str {
 
 fn exponential_backoff(base_delay: std::time::Duration, retries: u32) -> std::time::Duration {
     let pow = 2u32.pow(retries);
-    let backoff = base_delay.saturating_mul(pow);
-    backoff
+    
+    base_delay.saturating_mul(pow)
 }
 
 #[derive(Debug)]
