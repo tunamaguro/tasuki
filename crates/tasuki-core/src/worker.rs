@@ -2,11 +2,6 @@
 //!
 //! Periodic polling, bounded concurrency, heartbeats while running, explicit
 //! completion. Spawning is pluggable.
-//!
-//! Why these choices:
-//! - Fetch only when capacity is free to avoid overfetch and wasted leases.
-//! - Heartbeat inside `select!` to keep leases fresh under slow handlers.
-//! - Drain on shutdown to make exit behavior predictable.
 use crate::{
     JobHandler, JobResult,
     backend::{BackEndContext, BackEndPoller, Job},
