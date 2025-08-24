@@ -1,7 +1,4 @@
 //! Tokio-based job spawner.
-//!
-//! Why: isolate runtime concerns. We log job panics to surface failures
-//! without taking the whole worker down.
 use pin_project_lite::pin_project;
 
 use crate::worker::JobSpawner;

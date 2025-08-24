@@ -1,10 +1,5 @@
 //! Core contract between worker and storage backend.
-//!
-//! Why: make background work boring and predictable.
-//! - Handlers state intent; no hidden retries or implicit success.
-//! - Worker enforces pacing (ticks, concurrency) and liveness (heartbeat).
-//! - Backend persists state transitions; storage policy stays behind the
-//!   trait boundary. Responsibilities do not bleed across layers.
+
 pub mod backend;
 pub mod utils;
 pub mod worker;
@@ -18,12 +13,6 @@ pub use worker::{Worker, WorkerBuilder, WorkerWithGracefulShutdown};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Outcome a handler wants to persist.
-///
-/// Why: force explicitness so operators and code can reason about progress.
-/// Choose the smallest honest outcome instead of masking failures.
-/// - `Complete`: finished and durable.
-/// - `Retry`: transient failure; let the system try again (optionally later).
-/// - `Cancel`: permanent failure; do not waste capacity.
 pub enum JobResult {
     /// Mark the job as successfully completed.
     Complete,
@@ -52,15 +41,9 @@ pub trait JobHandler<M>: Send + Sync + Clone + 'static {
 }
 
 /// Explicitly opt-in to receive the payload.
-///
-/// Why: keep dependencies visible in signatures; discourage “reach into
-/// everything” handlers.
 pub struct JobData<T>(pub T);
 
 /// Explicitly opt-in to receive shared context (e.g., pools, config).
-///
-/// Why: separate data from environment. Context is cloned per job to avoid
-/// shared mutable state and surprising coupling.
 pub struct WorkerContext<S>(pub S);
 
 impl<F, Fut> JobHandler<()> for F

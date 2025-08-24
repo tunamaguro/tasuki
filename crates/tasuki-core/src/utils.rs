@@ -1,17 +1,11 @@
 //! Utility streams for timing and rate-limiting.
 //!
 //! `Ticker`: periodic wake-ups. `Throttle`: cap items per window (no buffering).
-//!
-//! Why: keep time-based behavior explicit and bounded. Prefer dropping over
-//! buffering to avoid hidden latency and memory growth.
 use futures::Stream;
 use pin_project_lite::pin_project;
 
 pin_project! {
     /// Fixed-period stream to drive polling or heartbeats.
-    ///
-    /// Why: a simple pulse under our control. We reset on ready to reduce
-    /// drift when consumers stall briefly.
     pub struct Ticker {
         #[pin]
         inner: futures_timer::Delay,
@@ -145,3 +139,5 @@ pub trait ThrottleExt: Stream {
         Throttle::new_with_tick(self, ticker, max_count)
     }
 }
+
+impl<St> ThrottleExt for St where St: Stream {}

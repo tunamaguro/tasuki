@@ -117,3 +117,48 @@ WHERE
   j.status = 'failed'::tasuki_job_status
   AND j.attempts < j.max_attempts
   AND j.queue_name = sqlc.arg(queue_name)::TEXT;
+
+-- name: AggregateQueueStat :one
+SELECT 
+  SUM(
+    CASE WHEN status = 'pending'
+      THEN 1
+      ELSE 0
+    END
+  ) AS pending,
+  SUM(
+    CASE WHEN status = 'running'
+      THEN 1
+      ELSE 0
+    END
+  ) AS running,
+  SUM(
+    CASE WHEN status = 'completed'
+      THEN 1
+      ELSE 0
+    END
+  ) AS completed,
+  SUM(
+    CASE WHEN status = 'failed'
+      THEN 1
+      ELSE 0
+    END
+  ) AS failed,
+  SUM(
+    CASE WHEN status = 'canceled'
+      THEN 1
+      ELSE 0
+    END
+  ) AS canceled
+FROM 
+  tasuki_job
+WHERE 
+  queue_name = sqlc.arg(queue_name);
+
+-- name: CleanJobs :many
+DELETE FROM
+  tasuki_job
+WHERE 
+  status = sqlc.arg(job_status)
+  AND queue_name = sqlc.arg(queue_name)
+RETURNING id;

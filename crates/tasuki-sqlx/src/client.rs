@@ -5,6 +5,16 @@ use std::future::Future;
 
 use crate::queries;
 
+/// Target status when cleaning jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
 /// Configuration for inserting a job into the queue.
 ///
 /// The generic `T` represents the job payload that will be serialized and
@@ -152,6 +162,54 @@ impl<T> Client<T> {
             queue_name: queue_name.into(),
             ..self
         }
+    }
+
+    /// Aggregate job counts for the client's queue name.
+    ///
+    /// Returns counts by status. If the queue has no rows yet, zeros are returned.
+    pub async fn aggregate_status(&self) -> Result<QueueStats, Error> {
+        let r = queries::AggregateQueueStat::builder()
+            .queue_name(self.queue_name.as_ref())
+            .build()
+            .query_one(&self.pool)
+            .await?;
+
+        let stats = QueueStats {
+            queue_name: self.queue_name.to_string(),
+            pending: r.pending,
+            running: r.running,
+            completed: r.completed,
+            failed: r.failed,
+            canceled: r.canceled,
+        };
+
+        Ok(stats)
+    }
+
+    /// Delete all jobs in this client's queue for the given status.
+    ///
+    /// - `status`: When `None`, defaults to `CleanStatus::Completed`.
+    /// - Returns the list of deleted job ids.
+    pub async fn clean(
+        &self,
+        status: Option<CleanStatus>,
+    ) -> Result<Vec<sqlx::types::Uuid>, Error> {
+        let status = match status.unwrap_or(CleanStatus::Completed) {
+            CleanStatus::Pending => queries::TasukiJobStatus::Pending,
+            CleanStatus::Running => queries::TasukiJobStatus::Running,
+            CleanStatus::Completed => queries::TasukiJobStatus::Completed,
+            CleanStatus::Failed => queries::TasukiJobStatus::Failed,
+            CleanStatus::Canceled => queries::TasukiJobStatus::Canceled,
+        };
+
+        let rows = queries::CleanJobs::builder()
+            .job_status(status)
+            .queue_name(self.queue_name.as_ref())
+            .build()
+            .query_many(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(|r| r.id).collect())
     }
 }
 
@@ -307,4 +365,15 @@ where
             Ok(())
         }
     }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone, PartialEq, Eq)]
+/// Aggregate counts of jobs by status for a queue.
+pub struct QueueStats {
+    pub queue_name: String,
+    pub pending: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub canceled: i64,
 }

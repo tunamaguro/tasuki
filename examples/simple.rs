@@ -57,7 +57,7 @@ async fn job_handler(
         tracing::info!("--end: job {}", count)
     });
     match handle.await {
-        Ok(_) => JobResult::Cancel,
+        Ok(_) => JobResult::Complete,
         Err(_) => JobResult::Retry(None),
     }
 }

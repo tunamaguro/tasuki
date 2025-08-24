@@ -8,7 +8,7 @@ pub mod backend;
 pub mod client;
 
 pub use backend::{BackEnd, Listener, WorkerWithListenerExt};
-pub use client::{Client, InsertJob};
+pub use client::{CleanStatus, Client, InsertJob, QueueStats};
 
 const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
 const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";
@@ -46,6 +46,26 @@ impl<'q> sqlx::Encode<'q, sqlx::Postgres> for PgDateTime {
 
     fn size_hint(&self) -> usize {
         std::mem::size_of::<i64>()
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PgDateTime {
+    fn decode(
+        value: <sqlx::Postgres as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let pg_us = <i64 as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+
+        // i64::MIN and i64::MAX reserved for +-infinity but not supported
+        // See https://github.com/postgres/postgres/blob/master/src/include/datatype/timestamp.h#L146-L151
+        if pg_us == i64::MIN || pg_us == i64::MAX {
+            return Err("timestamptz is ±infinity; PgDateTime cannot represent infinity".into());
+        }
+
+        let base = postgresql_epoch();
+        let d = std::time::Duration::from_micros(pg_us.unsigned_abs());
+        let t = if pg_us >= 0 { base + d } else { base - d };
+
+        Ok(Self(t))
     }
 }
 
