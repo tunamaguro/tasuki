@@ -5,7 +5,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use tasuki_core::{
     BackEndContext, BackEndDriver, BackEndPoller, Job, JobHandler, Worker,
     backend::Heartbeat,
-    utils::{Throttle, Ticker},
+    utils::{Throttle, ThrottleExt, Ticker},
     worker::{JobSpawner, TickStream},
 };
 
@@ -459,7 +459,7 @@ where
 
         self.modify_stream(|tick| {
             let st = futures::stream::select(tick, subscribe);
-            Throttle::<futures::stream::Select<Tick, Subscribe>, Ticker>::new(st, duration, count)
+            st.throttle(duration, count)
         })
     }
 }
