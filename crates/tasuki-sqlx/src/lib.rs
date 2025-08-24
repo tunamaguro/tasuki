@@ -49,6 +49,26 @@ impl<'q> sqlx::Encode<'q, sqlx::Postgres> for PgDateTime {
     }
 }
 
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PgDateTime {
+    fn decode(
+        value: <sqlx::Postgres as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let pg_us = <i64 as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+
+        // i64::MIN and i64::MAX reserved for +-infinity but not supported
+        // See https://github.com/postgres/postgres/blob/master/src/include/datatype/timestamp.h#L146-L151
+        if pg_us == i64::MIN || pg_us == i64::MAX {
+            return Err("timestamptz is ±infinity; PgDateTime cannot represent infinity".into());
+        }
+
+        let base = postgresql_epoch();
+        let d = std::time::Duration::from_micros(pg_us.unsigned_abs());
+        let t = if pg_us >= 0 { base + d } else { base - d };
+
+        Ok(Self(t))
+    }
+}
+
 /// TIMESTAMPTZは`2000-01-01 00:00:00`からのマイクロ秒で表現されている
 /// これはUNIXタイムスタンプから`2000-01-01 00:00:00`までの経過時間
 /// https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
