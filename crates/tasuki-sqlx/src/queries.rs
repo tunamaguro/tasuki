@@ -1374,3 +1374,131 @@ impl<'a> CleanJobsBuilder<'a, (TasukiJobStatus, &'a str)> {
         }
     }
 }
+#[derive(sqlx::FromRow)]
+pub struct ListJobsRow {
+    #[sqlx(rename = "id")]
+    pub id: sqlx::types::Uuid,
+    #[sqlx(rename = "status")]
+    pub status: TasukiJobStatus,
+}
+pub struct ListJobs<'a> {
+    cursor_job_id: Option<sqlx::types::Uuid>,
+    queue_name: Option<&'a str>,
+    page_size: i32,
+}
+impl<'a> ListJobs<'a> {
+    pub const QUERY: &'static str = r"SELECT
+  j.id,
+  j.status
+FROM
+  tasuki_job j
+WHERE
+  j.created_at < CASE 
+    WHEN $1::UUID IS NOT NULL
+      THEN (
+        SELECT 
+          created_at
+        FROM 
+          tasuki_job jj
+        WHERE
+          jj.id = $1::UUID
+          AND jj.queue_name = $2
+        )
+    ELSE (
+        SELECT
+          MAX(created_at)
+        FROM
+          tasuki_job jj
+        WHERE
+          jj.queue_name = $2
+        LIMIT 1
+        )
+  END
+  AND j.queue_name = $2
+ORDER BY j.created_at DESC, j.id DESC
+LIMIT $3";
+    pub fn query_as(
+        &'a self,
+    ) -> sqlx::query::QueryAs<
+        'a,
+        sqlx::Postgres,
+        ListJobsRow,
+        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
+    > {
+        sqlx::query_as::<_, ListJobsRow>(Self::QUERY)
+            .bind(self.cursor_job_id)
+            .bind(self.queue_name)
+            .bind(self.page_size)
+    }
+    pub fn query_many<'b, A>(
+        &'a self,
+        conn: A,
+    ) -> impl Future<Output = Result<Vec<ListJobsRow>, sqlx::Error>> + Send + 'a
+    where
+        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
+    {
+        async move {
+            let mut conn = conn.acquire().await?;
+            let vals = self.query_as().fetch_all(&mut *conn).await?;
+            Ok(vals)
+        }
+    }
+}
+impl<'a> ListJobs<'a> {
+    pub const fn builder() -> ListJobsBuilder<'a, ((), (), ())> {
+        ListJobsBuilder {
+            fields: ((), (), ()),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+pub struct ListJobsBuilder<'a, Fields = ((), (), ())> {
+    fields: Fields,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+impl<'a, QueueName, PageSize> ListJobsBuilder<'a, ((), QueueName, PageSize)> {
+    pub fn cursor_job_id(
+        self,
+        cursor_job_id: Option<sqlx::types::Uuid>,
+    ) -> ListJobsBuilder<'a, (Option<sqlx::types::Uuid>, QueueName, PageSize)> {
+        let ((), queue_name, page_size) = self.fields;
+        let _phantom = self._phantom;
+        ListJobsBuilder {
+            fields: (cursor_job_id, queue_name, page_size),
+            _phantom,
+        }
+    }
+}
+impl<'a, CursorJobId, PageSize> ListJobsBuilder<'a, (CursorJobId, (), PageSize)> {
+    pub fn queue_name(
+        self,
+        queue_name: Option<&'a str>,
+    ) -> ListJobsBuilder<'a, (CursorJobId, Option<&'a str>, PageSize)> {
+        let (cursor_job_id, (), page_size) = self.fields;
+        let _phantom = self._phantom;
+        ListJobsBuilder {
+            fields: (cursor_job_id, queue_name, page_size),
+            _phantom,
+        }
+    }
+}
+impl<'a, CursorJobId, QueueName> ListJobsBuilder<'a, (CursorJobId, QueueName, ())> {
+    pub fn page_size(self, page_size: i32) -> ListJobsBuilder<'a, (CursorJobId, QueueName, i32)> {
+        let (cursor_job_id, queue_name, ()) = self.fields;
+        let _phantom = self._phantom;
+        ListJobsBuilder {
+            fields: (cursor_job_id, queue_name, page_size),
+            _phantom,
+        }
+    }
+}
+impl<'a> ListJobsBuilder<'a, (Option<sqlx::types::Uuid>, Option<&'a str>, i32)> {
+    pub const fn build(self) -> ListJobs<'a> {
+        let (cursor_job_id, queue_name, page_size) = self.fields;
+        ListJobs {
+            cursor_job_id,
+            queue_name,
+            page_size,
+        }
+    }
+}
