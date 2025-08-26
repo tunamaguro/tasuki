@@ -5,14 +5,55 @@ use std::future::Future;
 
 use crate::queries;
 
-/// Target status when cleaning jobs.
+/// Job status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CleanStatus {
+pub enum JobStatus {
     Pending,
     Running,
     Completed,
     Failed,
     Canceled,
+}
+
+impl From<crate::queries::TasukiJobStatus> for JobStatus {
+    fn from(value: crate::queries::TasukiJobStatus) -> Self {
+        match value {
+            crate::queries::TasukiJobStatus::Pending => JobStatus::Pending,
+            crate::queries::TasukiJobStatus::Running => JobStatus::Running,
+            crate::queries::TasukiJobStatus::Completed => JobStatus::Completed,
+            crate::queries::TasukiJobStatus::Failed => JobStatus::Failed,
+            crate::queries::TasukiJobStatus::Canceled => JobStatus::Canceled,
+        }
+    }
+}
+
+impl From<JobStatus> for crate::queries::TasukiJobStatus {
+    fn from(value: JobStatus) -> Self {
+        match value {
+            JobStatus::Pending => crate::queries::TasukiJobStatus::Pending,
+            JobStatus::Running => crate::queries::TasukiJobStatus::Running,
+            JobStatus::Completed => crate::queries::TasukiJobStatus::Completed,
+            JobStatus::Failed => crate::queries::TasukiJobStatus::Failed,
+            JobStatus::Canceled => crate::queries::TasukiJobStatus::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Minimal job information for client listings.
+pub struct JobInfo {
+    pub id: sqlx::types::Uuid,
+    pub status: JobStatus,
+}
+
+#[derive(Debug, Clone)]
+/// Options to list jobs belonging to the client's queue.
+pub struct ListJobsOptions {
+    /// Cursor for keyset pagination. When provided, entries created strictly
+    /// before the cursor's creation time are returned.
+    pub cursor_job_id: Option<sqlx::types::Uuid>,
+    /// Maximum number of rows to return.
+    pub page_size: u32,
 }
 
 /// Configuration for inserting a job into the queue.
@@ -186,30 +227,30 @@ impl<T> Client<T> {
         Ok(stats)
     }
 
-    /// Delete all jobs in this client's queue for the given status.
+    /// List jobs for the configured queue using keyset pagination.
     ///
-    /// - `status`: When `None`, defaults to `CleanStatus::Completed`.
-    /// - Returns the list of deleted job ids.
-    pub async fn clean(
-        &self,
-        status: Option<CleanStatus>,
-    ) -> Result<Vec<sqlx::types::Uuid>, Error> {
-        let status = match status.unwrap_or(CleanStatus::Completed) {
-            CleanStatus::Pending => queries::TasukiJobStatus::Pending,
-            CleanStatus::Running => queries::TasukiJobStatus::Running,
-            CleanStatus::Completed => queries::TasukiJobStatus::Completed,
-            CleanStatus::Failed => queries::TasukiJobStatus::Failed,
-            CleanStatus::Canceled => queries::TasukiJobStatus::Canceled,
-        };
+    /// Returns at most `page_size` records ordered by `created_at DESC, id DESC`.
+    pub async fn list_jobs(&self, opts: &ListJobsOptions) -> Result<Vec<JobInfo>, Error> {
+        // Convert page size to i32, clamping on overflow.
+        let page_size = i32::try_from(opts.page_size).unwrap_or(i32::MAX);
 
-        let rows = queries::CleanJobs::builder()
-            .job_status(status)
-            .queue_name(self.queue_name.as_ref())
+        let rows = queries::ListJobs::builder()
+            .cursor_job_id(opts.cursor_job_id)
+            .queue_name(Some(self.queue_name.as_ref()))
+            .page_size(page_size)
             .build()
             .query_many(&self.pool)
             .await?;
 
-        Ok(rows.into_iter().map(|r| r.id).collect())
+        let jobs = rows
+            .into_iter()
+            .map(|r| JobInfo {
+                id: r.id,
+                status: JobStatus::from(r.status),
+            })
+            .collect();
+
+        Ok(jobs)
     }
 }
 

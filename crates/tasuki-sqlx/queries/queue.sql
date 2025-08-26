@@ -162,3 +162,35 @@ WHERE
   status = sqlc.arg(job_status)
   AND queue_name = sqlc.arg(queue_name)
 RETURNING id;
+
+-- name: ListJobs :many
+SELECT
+  j.id,
+  j.status
+FROM
+  tasuki_job j
+WHERE
+  j.created_at < CASE 
+    WHEN sqlc.narg(cursor_job_id)::UUID IS NOT NULL
+      THEN (
+        SELECT 
+          created_at
+        FROM 
+          tasuki_job jj
+        WHERE
+          jj.id = sqlc.narg(cursor_job_id)::UUID
+          AND jj.queue_name = sqlc.narg(queue_name)
+        )
+    ELSE (
+        SELECT
+          MAX(created_at)
+        FROM
+          tasuki_job jj
+        WHERE
+          jj.queue_name = sqlc.arg(queue_name)
+        LIMIT 1
+        )
+  END
+  AND j.queue_name = sqlc.arg(queue_name)
+ORDER BY j.created_at DESC, j.id DESC
+LIMIT sqlc.arg(page_size);
