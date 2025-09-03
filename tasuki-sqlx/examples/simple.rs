@@ -1,6 +1,6 @@
-use tasuki::{
-    BackEnd, Client, InsertJob, JobData, JobResult, TokioSpawner, WorkerBuilder, WorkerContext,
-};
+use tasuki_core::{JobData, JobResult, TokioSpawner, WorkerBuilder, WorkerContext};
+use tasuki_sqlx::backend::BackEnd;
+use tasuki_sqlx::client::{Client, InsertJob};
 
 #[tokio::main]
 async fn main() {
@@ -61,3 +61,4 @@ async fn job_handler(
         Err(_) => JobResult::Retry(None),
     }
 }
+

@@ -3,8 +3,7 @@
 // This example enqueues several jobs into the default queue and then
 // fetches a single page using the client listing API.
 use sqlx::types::Uuid;
-use tasuki::{Client, InsertJob};
-use tasuki_sqlx::client::ListJobsOptions;
+use tasuki_sqlx::client::{Client, InsertJob, ListJobsOptions};
 
 #[tokio::main]
 async fn main() {
@@ -69,3 +68,4 @@ async fn main() {
         panic!("unexpected")
     }
 }
+
