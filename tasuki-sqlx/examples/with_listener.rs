@@ -91,4 +91,3 @@ async fn job_handler(
         Err(_) => JobResult::Retry(None),
     }
 }
-
