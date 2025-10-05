@@ -1,0 +1,12 @@
+[package]
+name = "tasuki-postgres"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tasuki-core = { workspace = true }
+tracing = { workspace = true }
+
+tokio-postgres = { version = "0.7.14" }
+postgres-types = { version = "0.2.10", features = ["derive"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tasuki-core", "tasuki-sqlx"]
+members = ["tasuki-core", "tasuki-postgres", "tasuki-sqlx"]
 
 [workspace.package]
 edition = "2024"

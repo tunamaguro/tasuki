@@ -2,94 +2,37 @@
 //! sqlc version: v1.29.0
 //! sqlc-gen-rust version: v0.1.10
 
-pub struct CopyDataSink<C: std::ops::DerefMut<Target = sqlx::PgConnection>> {
-    encode_buf: sqlx::postgres::PgArgumentBuffer,
-    data_buf: Vec<u8>,
-    copy_in: sqlx::postgres::PgCopyIn<C>,
-}
-impl<C: std::ops::DerefMut<Target = sqlx::PgConnection>> CopyDataSink<C> {
-    const BUFFER_SIZE: usize = 4096;
-    fn new(copy_in: sqlx::postgres::PgCopyIn<C>) -> Self {
-        let mut data_buf = Vec::with_capacity(Self::BUFFER_SIZE);
-        const COPY_SIGNATURE: &[u8] = &[
-            b'P', b'G', b'C', b'O', b'P', b'Y', b'\n', 0xFF, b'\r', b'\n', 0x00,
-        ];
-        assert_eq!(COPY_SIGNATURE.len(), 11);
-        data_buf.extend_from_slice(COPY_SIGNATURE);
-        data_buf.extend(0_i32.to_be_bytes());
-        data_buf.extend(0_i32.to_be_bytes());
-        CopyDataSink {
-            encode_buf: Default::default(),
-            data_buf,
-            copy_in,
-        }
-    }
-    async fn send(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _copy_in = self.copy_in.send(self.data_buf.as_slice()).await?;
-        self.data_buf.clear();
-        Ok(())
-    }
-    /// Complete copy process and return number of rows affected.
-    pub async fn finish(mut self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        const COPY_TRAILER: &[u8] = &(-1_i16).to_be_bytes();
-        self.data_buf.extend(COPY_TRAILER);
-        self.send().await?;
-        self.copy_in.finish().await.map_err(|e| e.into())
-    }
-    fn insert_row(&mut self) {
-        let num_col = self.copy_in.num_columns() as i16;
-        self.data_buf.extend(num_col.to_be_bytes());
-    }
-    async fn add<'q, T>(
-        &mut self,
-        value: &T,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        T: sqlx::Encode<'q, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
-    {
-        let is_null = value.encode_by_ref(&mut self.encode_buf)?;
-        match is_null {
-            sqlx::encode::IsNull::Yes => {
-                self.data_buf.extend((-1_i32).to_be_bytes());
-            }
-            sqlx::encode::IsNull::No => {
-                self.data_buf
-                    .extend((self.encode_buf.len() as i32).to_be_bytes());
-                self.data_buf.extend_from_slice(self.encode_buf.as_slice());
-            }
-        }
-        self.encode_buf.clear();
-        if self.data_buf.len() > Self::BUFFER_SIZE {
-            self.send().await?;
-        }
-        Ok(())
-    }
-}
-#[derive(Debug, Clone, Copy, sqlx::Type)]
-#[sqlx(type_name = "tasuki_job_status")]
+use tokio_postgres::types::ToSql;
+#[derive(Debug, Clone, Copy, postgres_types::ToSql, postgres_types::FromSql)]
+#[postgres(name = "tasuki_job_status")]
 pub enum TasukiJobStatus {
-    #[sqlx(rename = "pending")]
+    #[postgres(name = "pending")]
     Pending,
-    #[sqlx(rename = "running")]
+    #[postgres(name = "running")]
     Running,
-    #[sqlx(rename = "completed")]
+    #[postgres(name = "completed")]
     Completed,
-    #[sqlx(rename = "failed")]
+    #[postgres(name = "failed")]
     Failed,
-    #[sqlx(rename = "canceled")]
+    #[postgres(name = "canceled")]
     Canceled,
 }
-#[derive(sqlx::FromRow)]
 pub struct GetAvailableJobsRow {
-    #[sqlx(rename = "id")]
-    pub id: sqlx::types::Uuid,
-    #[sqlx(rename = "job_data")]
+    pub id: uuid::Uuid,
     pub job_data: serde_json::Value,
-    #[sqlx(rename = "lease_token")]
-    pub lease_token: sqlx::types::Uuid,
+    pub lease_token: uuid::Uuid,
+}
+impl GetAvailableJobsRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            job_data: row.try_get(1)?,
+            lease_token: row.try_get(2)?,
+        })
+    }
 }
 pub struct GetAvailableJobs<'a> {
-    lease_interval: &'a sqlx::postgres::types::PgInterval,
+    lease_interval: crate::PgInterval,
     queue_name: &'a str,
     batch_size: i32,
 }
@@ -120,31 +63,31 @@ WHERE
     LIMIT $3
   )
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        GetAvailableJobsRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, GetAvailableJobsRow>(Self::QUERY)
-            .bind(self.lease_interval)
-            .bind(self.queue_name)
-            .bind(self.batch_size)
+    pub async fn query_many(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<Vec<GetAvailableJobsRow>, tokio_postgres::Error> {
+        let rows = client
+            .query(
+                Self::QUERY,
+                &[&self.lease_interval, &self.queue_name, &self.batch_size],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|r| GetAvailableJobsRow::from_row(&r))
+            .collect()
     }
-    pub fn query_many<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Vec<GetAvailableJobsRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
+    pub async fn query_stream(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
+        Ok(st)
+    }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
+        [&self.lease_interval, &self.queue_name, &self.batch_size]
     }
 }
 impl<'a> GetAvailableJobs<'a> {
@@ -162,9 +105,8 @@ pub struct GetAvailableJobsBuilder<'a, Fields = ((), (), ())> {
 impl<'a, QueueName, BatchSize> GetAvailableJobsBuilder<'a, ((), QueueName, BatchSize)> {
     pub fn lease_interval(
         self,
-        lease_interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, QueueName, BatchSize)>
-    {
+        lease_interval: crate::PgInterval,
+    ) -> GetAvailableJobsBuilder<'a, (crate::PgInterval, QueueName, BatchSize)> {
         let ((), queue_name, batch_size) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
@@ -199,7 +141,7 @@ impl<'a, LeaseInterval, QueueName> GetAvailableJobsBuilder<'a, (LeaseInterval, Q
         }
     }
 }
-impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a str, i32)> {
+impl<'a> GetAvailableJobsBuilder<'a, (crate::PgInterval, &'a str, i32)> {
     pub const fn build(self) -> GetAvailableJobs<'a> {
         let (lease_interval, queue_name, batch_size) = self.fields;
         GetAvailableJobs {
@@ -209,17 +151,22 @@ impl<'a> GetAvailableJobsBuilder<'a, (&'a sqlx::postgres::types::PgInterval, &'a
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct HeartBeatJobRow {
-    #[sqlx(rename = "status")]
     pub status: TasukiJobStatus,
 }
-pub struct HeartBeatJob<'a> {
-    lease_interval: &'a sqlx::postgres::types::PgInterval,
-    id: sqlx::types::Uuid,
-    lease_token: Option<sqlx::types::Uuid>,
+impl HeartBeatJobRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            status: row.try_get(0)?,
+        })
+    }
 }
-impl<'a> HeartBeatJob<'a> {
+pub struct HeartBeatJob {
+    lease_interval: crate::PgInterval,
+    id: uuid::Uuid,
+    lease_token: Option<uuid::Uuid>,
+}
+impl HeartBeatJob {
     pub const QUERY: &'static str = r"UPDATE 
   tasuki_job j
 SET
@@ -232,48 +179,29 @@ WHERE
   id = $2
   AND lease_token = $3
 RETURNING j.status";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        HeartBeatJobRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, HeartBeatJobRow>(Self::QUERY)
-            .bind(self.lease_interval)
-            .bind(self.id)
-            .bind(self.lease_token)
+    pub async fn query_one(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<HeartBeatJobRow, tokio_postgres::Error> {
+        let row = client.query_one(Self::QUERY, &self.as_slice()).await?;
+        HeartBeatJobRow::from_row(&row)
     }
-    pub fn query_one<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<HeartBeatJobRow, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let val = self.query_as().fetch_one(&mut *conn).await?;
-            Ok(val)
+    pub async fn query_opt(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<Option<HeartBeatJobRow>, tokio_postgres::Error> {
+        let row = client.query_opt(Self::QUERY, &self.as_slice()).await?;
+        match row {
+            Some(row) => Ok(Some(HeartBeatJobRow::from_row(&row)?)),
+            None => Ok(None),
         }
     }
-    pub fn query_opt<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Option<HeartBeatJobRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let val = self.query_as().fetch_optional(&mut *conn).await?;
-            Ok(val)
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
+        [&self.lease_interval, &self.id, &self.lease_token]
     }
 }
-impl<'a> HeartBeatJob<'a> {
-    pub const fn builder() -> HeartBeatJobBuilder<'a, ((), (), ())> {
+impl HeartBeatJob {
+    pub const fn builder() -> HeartBeatJobBuilder<'static, ((), (), ())> {
         HeartBeatJobBuilder {
             fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
@@ -287,8 +215,8 @@ pub struct HeartBeatJobBuilder<'a, Fields = ((), (), ())> {
 impl<'a, Id, LeaseToken> HeartBeatJobBuilder<'a, ((), Id, LeaseToken)> {
     pub fn lease_interval(
         self,
-        lease_interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> HeartBeatJobBuilder<'a, (&'a sqlx::postgres::types::PgInterval, Id, LeaseToken)> {
+        lease_interval: crate::PgInterval,
+    ) -> HeartBeatJobBuilder<'a, (crate::PgInterval, Id, LeaseToken)> {
         let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         HeartBeatJobBuilder {
@@ -300,8 +228,8 @@ impl<'a, Id, LeaseToken> HeartBeatJobBuilder<'a, ((), Id, LeaseToken)> {
 impl<'a, LeaseInterval, LeaseToken> HeartBeatJobBuilder<'a, (LeaseInterval, (), LeaseToken)> {
     pub fn id(
         self,
-        id: sqlx::types::Uuid,
-    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, sqlx::types::Uuid, LeaseToken)> {
+        id: uuid::Uuid,
+    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, uuid::Uuid, LeaseToken)> {
         let (lease_interval, (), lease_token) = self.fields;
         let _phantom = self._phantom;
         HeartBeatJobBuilder {
@@ -313,8 +241,8 @@ impl<'a, LeaseInterval, LeaseToken> HeartBeatJobBuilder<'a, (LeaseInterval, (), 
 impl<'a, LeaseInterval, Id> HeartBeatJobBuilder<'a, (LeaseInterval, Id, ())> {
     pub fn lease_token(
         self,
-        lease_token: Option<sqlx::types::Uuid>,
-    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, Id, Option<sqlx::types::Uuid>)> {
+        lease_token: Option<uuid::Uuid>,
+    ) -> HeartBeatJobBuilder<'a, (LeaseInterval, Id, Option<uuid::Uuid>)> {
         let (lease_interval, id, ()) = self.fields;
         let _phantom = self._phantom;
         HeartBeatJobBuilder {
@@ -323,17 +251,8 @@ impl<'a, LeaseInterval, Id> HeartBeatJobBuilder<'a, (LeaseInterval, Id, ())> {
         }
     }
 }
-impl<'a>
-    HeartBeatJobBuilder<
-        'a,
-        (
-            &'a sqlx::postgres::types::PgInterval,
-            sqlx::types::Uuid,
-            Option<sqlx::types::Uuid>,
-        ),
-    >
-{
-    pub const fn build(self) -> HeartBeatJob<'a> {
+impl<'a> HeartBeatJobBuilder<'a, (crate::PgInterval, uuid::Uuid, Option<uuid::Uuid>)> {
+    pub const fn build(self) -> HeartBeatJob {
         let (lease_interval, id, lease_token) = self.fields;
         HeartBeatJob {
             lease_interval,
@@ -342,11 +261,15 @@ impl<'a>
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct CompleteJobRow {}
+impl CompleteJobRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct CompleteJob {
-    id: sqlx::types::Uuid,
-    lease_token: Option<sqlx::types::Uuid>,
+    id: uuid::Uuid,
+    lease_token: Option<uuid::Uuid>,
 }
 impl CompleteJob {
     pub const QUERY: &'static str = r"UPDATE 
@@ -356,35 +279,14 @@ SET
 WHERE
   id = $1
   AND lease_token = $2";
-    pub fn query_as<'a>(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        CompleteJobRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, CompleteJobRow>(Self::QUERY)
-            .bind(self.id)
-            .bind(self.lease_token)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'a, 'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .bind(self.lease_token)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
+        [&self.id, &self.lease_token]
     }
 }
 impl CompleteJob {
@@ -400,10 +302,7 @@ pub struct CompleteJobBuilder<'a, Fields = ((), ())> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a, LeaseToken> CompleteJobBuilder<'a, ((), LeaseToken)> {
-    pub fn id(
-        self,
-        id: sqlx::types::Uuid,
-    ) -> CompleteJobBuilder<'a, (sqlx::types::Uuid, LeaseToken)> {
+    pub fn id(self, id: uuid::Uuid) -> CompleteJobBuilder<'a, (uuid::Uuid, LeaseToken)> {
         let ((), lease_token) = self.fields;
         let _phantom = self._phantom;
         CompleteJobBuilder {
@@ -415,8 +314,8 @@ impl<'a, LeaseToken> CompleteJobBuilder<'a, ((), LeaseToken)> {
 impl<'a, Id> CompleteJobBuilder<'a, (Id, ())> {
     pub fn lease_token(
         self,
-        lease_token: Option<sqlx::types::Uuid>,
-    ) -> CompleteJobBuilder<'a, (Id, Option<sqlx::types::Uuid>)> {
+        lease_token: Option<uuid::Uuid>,
+    ) -> CompleteJobBuilder<'a, (Id, Option<uuid::Uuid>)> {
         let (id, ()) = self.fields;
         let _phantom = self._phantom;
         CompleteJobBuilder {
@@ -425,17 +324,21 @@ impl<'a, Id> CompleteJobBuilder<'a, (Id, ())> {
         }
     }
 }
-impl<'a> CompleteJobBuilder<'a, (sqlx::types::Uuid, Option<sqlx::types::Uuid>)> {
+impl<'a> CompleteJobBuilder<'a, (uuid::Uuid, Option<uuid::Uuid>)> {
     pub const fn build(self) -> CompleteJob {
         let (id, lease_token) = self.fields;
         CompleteJob { id, lease_token }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct CancelJobRow {}
+impl CancelJobRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct CancelJob {
-    id: sqlx::types::Uuid,
-    lease_token: Option<sqlx::types::Uuid>,
+    id: uuid::Uuid,
+    lease_token: Option<uuid::Uuid>,
 }
 impl CancelJob {
     pub const QUERY: &'static str = r"UPDATE
@@ -445,35 +348,14 @@ SET
 WHERE
   id = $1
   AND lease_token = $2";
-    pub fn query_as<'a>(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        CancelJobRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, CancelJobRow>(Self::QUERY)
-            .bind(self.id)
-            .bind(self.lease_token)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'a, 'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .bind(self.lease_token)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
+        [&self.id, &self.lease_token]
     }
 }
 impl CancelJob {
@@ -489,10 +371,7 @@ pub struct CancelJobBuilder<'a, Fields = ((), ())> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a, LeaseToken> CancelJobBuilder<'a, ((), LeaseToken)> {
-    pub fn id(
-        self,
-        id: sqlx::types::Uuid,
-    ) -> CancelJobBuilder<'a, (sqlx::types::Uuid, LeaseToken)> {
+    pub fn id(self, id: uuid::Uuid) -> CancelJobBuilder<'a, (uuid::Uuid, LeaseToken)> {
         let ((), lease_token) = self.fields;
         let _phantom = self._phantom;
         CancelJobBuilder {
@@ -504,8 +383,8 @@ impl<'a, LeaseToken> CancelJobBuilder<'a, ((), LeaseToken)> {
 impl<'a, Id> CancelJobBuilder<'a, (Id, ())> {
     pub fn lease_token(
         self,
-        lease_token: Option<sqlx::types::Uuid>,
-    ) -> CancelJobBuilder<'a, (Id, Option<sqlx::types::Uuid>)> {
+        lease_token: Option<uuid::Uuid>,
+    ) -> CancelJobBuilder<'a, (Id, Option<uuid::Uuid>)> {
         let (id, ()) = self.fields;
         let _phantom = self._phantom;
         CancelJobBuilder {
@@ -514,20 +393,24 @@ impl<'a, Id> CancelJobBuilder<'a, (Id, ())> {
         }
     }
 }
-impl<'a> CancelJobBuilder<'a, (sqlx::types::Uuid, Option<sqlx::types::Uuid>)> {
+impl<'a> CancelJobBuilder<'a, (uuid::Uuid, Option<uuid::Uuid>)> {
     pub const fn build(self) -> CancelJob {
         let (id, lease_token) = self.fields;
         CancelJob { id, lease_token }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct RetryJobRow {}
-pub struct RetryJob<'a> {
-    interval: Option<&'a sqlx::postgres::types::PgInterval>,
-    id: sqlx::types::Uuid,
-    lease_token: Option<sqlx::types::Uuid>,
+impl RetryJobRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
 }
-impl<'a> RetryJob<'a> {
+pub struct RetryJob {
+    interval: Option<crate::PgInterval>,
+    id: uuid::Uuid,
+    lease_token: Option<uuid::Uuid>,
+}
+impl RetryJob {
     pub const QUERY: &'static str = r"UPDATE tasuki_job j
 SET 
   status = CASE 
@@ -546,41 +429,18 @@ SET
 WHERE 
   id = $2
   AND lease_token = $3";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        RetryJobRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, RetryJobRow>(Self::QUERY)
-            .bind(self.interval)
-            .bind(self.id)
-            .bind(self.lease_token)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.interval)
-                .bind(self.id)
-                .bind(self.lease_token)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
+        [&self.interval, &self.id, &self.lease_token]
     }
 }
-impl<'a> RetryJob<'a> {
-    pub const fn builder() -> RetryJobBuilder<'a, ((), (), ())> {
+impl RetryJob {
+    pub const fn builder() -> RetryJobBuilder<'static, ((), (), ())> {
         RetryJobBuilder {
             fields: ((), (), ()),
             _phantom: std::marker::PhantomData,
@@ -594,15 +454,8 @@ pub struct RetryJobBuilder<'a, Fields = ((), (), ())> {
 impl<'a, Id, LeaseToken> RetryJobBuilder<'a, ((), Id, LeaseToken)> {
     pub fn interval(
         self,
-        interval: Option<&'a sqlx::postgres::types::PgInterval>,
-    ) -> RetryJobBuilder<
-        'a,
-        (
-            Option<&'a sqlx::postgres::types::PgInterval>,
-            Id,
-            LeaseToken,
-        ),
-    > {
+        interval: Option<crate::PgInterval>,
+    ) -> RetryJobBuilder<'a, (Option<crate::PgInterval>, Id, LeaseToken)> {
         let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -612,10 +465,7 @@ impl<'a, Id, LeaseToken> RetryJobBuilder<'a, ((), Id, LeaseToken)> {
     }
 }
 impl<'a, Interval, LeaseToken> RetryJobBuilder<'a, (Interval, (), LeaseToken)> {
-    pub fn id(
-        self,
-        id: sqlx::types::Uuid,
-    ) -> RetryJobBuilder<'a, (Interval, sqlx::types::Uuid, LeaseToken)> {
+    pub fn id(self, id: uuid::Uuid) -> RetryJobBuilder<'a, (Interval, uuid::Uuid, LeaseToken)> {
         let (interval, (), lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -627,8 +477,8 @@ impl<'a, Interval, LeaseToken> RetryJobBuilder<'a, (Interval, (), LeaseToken)> {
 impl<'a, Interval, Id> RetryJobBuilder<'a, (Interval, Id, ())> {
     pub fn lease_token(
         self,
-        lease_token: Option<sqlx::types::Uuid>,
-    ) -> RetryJobBuilder<'a, (Interval, Id, Option<sqlx::types::Uuid>)> {
+        lease_token: Option<uuid::Uuid>,
+    ) -> RetryJobBuilder<'a, (Interval, Id, Option<uuid::Uuid>)> {
         let (interval, id, ()) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -637,17 +487,8 @@ impl<'a, Interval, Id> RetryJobBuilder<'a, (Interval, Id, ())> {
         }
     }
 }
-impl<'a>
-    RetryJobBuilder<
-        'a,
-        (
-            Option<&'a sqlx::postgres::types::PgInterval>,
-            sqlx::types::Uuid,
-            Option<sqlx::types::Uuid>,
-        ),
-    >
-{
-    pub const fn build(self) -> RetryJob<'a> {
+impl<'a> RetryJobBuilder<'a, (Option<crate::PgInterval>, uuid::Uuid, Option<uuid::Uuid>)> {
+    pub const fn build(self) -> RetryJob {
         let (interval, id, lease_token) = self.fields;
         RetryJob {
             interval,
@@ -656,13 +497,17 @@ impl<'a>
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct InsertJobOneRow {}
+impl InsertJobOneRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct InsertJobOne<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
     queue_name: &'a str,
-    interval: &'a sqlx::postgres::types::PgInterval,
+    interval: crate::PgInterval,
 }
 impl<'a> InsertJobOne<'a> {
     pub const QUERY: &'static str = r"INSERT INTO
@@ -670,39 +515,19 @@ impl<'a> InsertJobOne<'a> {
   (max_attempts, job_data, queue_name, scheduled_at)
 VALUES
   ($1, $2, $3, clock_timestamp() + $4::INTERVAL)";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        InsertJobOneRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, InsertJobOneRow>(Self::QUERY)
-            .bind(self.max_attempts)
-            .bind(self.job_data)
-            .bind(self.queue_name)
-            .bind(self.interval)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.max_attempts)
-                .bind(self.job_data)
-                .bind(self.queue_name)
-                .bind(self.interval)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 4] {
+        [
+            &self.max_attempts,
+            &self.job_data,
+            &self.queue_name,
+            &self.interval,
+        ]
     }
 }
 impl<'a> InsertJobOne<'a> {
@@ -765,16 +590,8 @@ impl<'a, MaxAttempts, JobData, QueueName>
 {
     pub fn interval(
         self,
-        interval: &'a sqlx::postgres::types::PgInterval,
-    ) -> InsertJobOneBuilder<
-        'a,
-        (
-            MaxAttempts,
-            JobData,
-            QueueName,
-            &'a sqlx::postgres::types::PgInterval,
-        ),
-    > {
+        interval: crate::PgInterval,
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, crate::PgInterval)> {
         let (max_attempts, job_data, queue_name, ()) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
@@ -783,17 +600,7 @@ impl<'a, MaxAttempts, JobData, QueueName>
         }
     }
 }
-impl<'a>
-    InsertJobOneBuilder<
-        'a,
-        (
-            i32,
-            &'a serde_json::Value,
-            &'a str,
-            &'a sqlx::postgres::types::PgInterval,
-        ),
-    >
-{
+impl<'a> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::PgInterval)> {
     pub const fn build(self) -> InsertJobOne<'a> {
         let (max_attempts, job_data, queue_name, interval) = self.fields;
         InsertJobOne {
@@ -804,55 +611,27 @@ impl<'a>
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct InsertJobManyRow {}
+impl InsertJobManyRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct InsertJobMany<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
     queue_name: &'a str,
-    scheduled_at: crate::PgDateTime,
+    scheduled_at: &'a std::time::SystemTime,
 }
 impl<'a> InsertJobMany<'a> {
     pub const QUERY: &'static str = r"COPY tasuki_job (max_attempts,job_data,queue_name,scheduled_at) FROM STDIN (FORMAT BINARY)";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        InsertJobManyRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, InsertJobManyRow>(Self::QUERY)
-            .bind(self.max_attempts)
-            .bind(self.job_data)
-            .bind(self.queue_name)
-            .bind(self.scheduled_at)
-    }
-    pub async fn copy_in<PgCopy>(
-        conn: &PgCopy,
-    ) -> Result<CopyDataSink<sqlx::pool::PoolConnection<sqlx::Postgres>>, sqlx::Error>
-    where
-        PgCopy: sqlx::postgres::PgPoolCopyExt,
-    {
-        let copy_in = conn.copy_in_raw(Self::QUERY).await?;
-        Ok(CopyDataSink::new(copy_in))
-    }
-    pub async fn copy_in_tx(
-        conn: &mut sqlx::postgres::PgConnection,
-    ) -> Result<CopyDataSink<&mut sqlx::postgres::PgConnection>, sqlx::Error> {
-        let copy_in = conn.copy_in_raw(Self::QUERY).await?;
-        Ok(CopyDataSink::new(copy_in))
-    }
-    pub async fn write<C: std::ops::DerefMut<Target = sqlx::PgConnection>>(
-        &self,
-        sink: &mut CopyDataSink<C>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sink.insert_row();
-        sink.add(&self.max_attempts).await?;
-        sink.add(&self.job_data).await?;
-        sink.add(&self.queue_name).await?;
-        sink.add(&self.scheduled_at).await?;
-        Ok(())
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 4] {
+        [
+            &self.max_attempts,
+            &self.job_data,
+            &self.queue_name,
+            &self.scheduled_at,
+        ]
     }
 }
 impl<'a> InsertJobMany<'a> {
@@ -918,8 +697,9 @@ impl<'a, MaxAttempts, JobData, QueueName>
 {
     pub fn scheduled_at(
         self,
-        scheduled_at: crate::PgDateTime,
-    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, crate::PgDateTime)> {
+        scheduled_at: &'a std::time::SystemTime,
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, &'a std::time::SystemTime)>
+    {
         let (max_attempts, job_data, queue_name, ()) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
@@ -928,7 +708,17 @@ impl<'a, MaxAttempts, JobData, QueueName>
         }
     }
 }
-impl<'a> InsertJobManyBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::PgDateTime)> {
+impl<'a>
+    InsertJobManyBuilder<
+        'a,
+        (
+            i32,
+            &'a serde_json::Value,
+            &'a str,
+            &'a std::time::SystemTime,
+        ),
+    >
+{
     pub const fn build(self) -> InsertJobMany<'a> {
         let (max_attempts, job_data, queue_name, scheduled_at) = self.fields;
         InsertJobMany {
@@ -939,10 +729,15 @@ impl<'a> InsertJobManyBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::P
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct AddJobNotifyRow {
-    #[sqlx(rename = "pg_notify")]
     pub pg_notify: (),
+}
+impl AddJobNotifyRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            pg_notify: row.try_get(0)?,
+        })
+    }
 }
 pub struct AddJobNotify<'a> {
     channel_name: &'a str,
@@ -953,35 +748,14 @@ impl<'a> AddJobNotify<'a> {
   $1::TEXT,
   json_build_object('q', $2::TEXT)::TEXT
 )";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        AddJobNotifyRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, AddJobNotifyRow>(Self::QUERY)
-            .bind(self.channel_name)
-            .bind(self.queue_name)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.channel_name)
-                .bind(self.queue_name)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
+        [&self.channel_name, &self.queue_name]
     }
 }
 impl<'a> AddJobNotify<'a> {
@@ -1031,10 +805,14 @@ impl<'a> AddJobNotifyBuilder<'a, (&'a str, &'a str)> {
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct CancelJobByIdRow {}
+impl CancelJobByIdRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct CancelJobById {
-    id: sqlx::types::Uuid,
+    id: uuid::Uuid,
 }
 impl CancelJobById {
     pub const QUERY: &'static str = r"UPDATE
@@ -1043,32 +821,14 @@ SET
   status = 'canceled'::tasuki_job_status
 WHERE
   id = $1";
-    pub fn query_as<'a>(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        CancelJobByIdRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, CancelJobByIdRow>(Self::QUERY).bind(self.id)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'a, 'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.id)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 1] {
+        [&self.id]
     }
 }
 impl CancelJobById {
@@ -1084,7 +844,7 @@ pub struct CancelJobByIdBuilder<'a, Fields = ((),)> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a> CancelJobByIdBuilder<'a, ((),)> {
-    pub fn id(self, id: sqlx::types::Uuid) -> CancelJobByIdBuilder<'a, (sqlx::types::Uuid,)> {
+    pub fn id(self, id: uuid::Uuid) -> CancelJobByIdBuilder<'a, (uuid::Uuid,)> {
         let ((),) = self.fields;
         let _phantom = self._phantom;
         CancelJobByIdBuilder {
@@ -1093,14 +853,18 @@ impl<'a> CancelJobByIdBuilder<'a, ((),)> {
         }
     }
 }
-impl<'a> CancelJobByIdBuilder<'a, (sqlx::types::Uuid,)> {
+impl<'a> CancelJobByIdBuilder<'a, (uuid::Uuid,)> {
     pub const fn build(self) -> CancelJobById {
         let (id,) = self.fields;
         CancelJobById { id }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct RetryFailedByQueueRow {}
+impl RetryFailedByQueueRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {})
+    }
+}
 pub struct RetryFailedByQueue<'a> {
     queue_name: &'a str,
 }
@@ -1115,32 +879,14 @@ WHERE
   j.status = 'failed'::tasuki_job_status
   AND j.attempts < j.max_attempts
   AND j.queue_name = $1::TEXT";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        RetryFailedByQueueRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, RetryFailedByQueueRow>(Self::QUERY).bind(self.queue_name)
+    pub async fn execute(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client.execute(Self::QUERY, &self.as_slice()).await
     }
-    pub fn execute<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<<sqlx::Postgres as sqlx::Database>::QueryResult, sqlx::Error>>
-    + Send
-    + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            sqlx::query(Self::QUERY)
-                .bind(self.queue_name)
-                .execute(&mut *conn)
-                .await
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 1] {
+        [&self.queue_name]
     }
 }
 impl<'a> RetryFailedByQueue<'a> {
@@ -1171,18 +917,23 @@ impl<'a> RetryFailedByQueueBuilder<'a, (&'a str,)> {
         RetryFailedByQueue { queue_name }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct AggregateQueueStatRow {
-    #[sqlx(rename = "pending")]
     pub pending: i64,
-    #[sqlx(rename = "running")]
     pub running: i64,
-    #[sqlx(rename = "completed")]
     pub completed: i64,
-    #[sqlx(rename = "failed")]
     pub failed: i64,
-    #[sqlx(rename = "canceled")]
     pub canceled: i64,
+}
+impl AggregateQueueStatRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            pending: row.try_get(0)?,
+            running: row.try_get(1)?,
+            completed: row.try_get(2)?,
+            failed: row.try_get(3)?,
+            canceled: row.try_get(4)?,
+        })
+    }
 }
 pub struct AggregateQueueStat<'a> {
     queue_name: &'a str,
@@ -1223,41 +974,25 @@ FROM
   tasuki_job
 WHERE 
   queue_name = $1";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        AggregateQueueStatRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, AggregateQueueStatRow>(Self::QUERY).bind(self.queue_name)
+    pub async fn query_one(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<AggregateQueueStatRow, tokio_postgres::Error> {
+        let row = client.query_one(Self::QUERY, &self.as_slice()).await?;
+        AggregateQueueStatRow::from_row(&row)
     }
-    pub fn query_one<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<AggregateQueueStatRow, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let val = self.query_as().fetch_one(&mut *conn).await?;
-            Ok(val)
+    pub async fn query_opt(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<Option<AggregateQueueStatRow>, tokio_postgres::Error> {
+        let row = client.query_opt(Self::QUERY, &self.as_slice()).await?;
+        match row {
+            Some(row) => Ok(Some(AggregateQueueStatRow::from_row(&row)?)),
+            None => Ok(None),
         }
     }
-    pub fn query_opt<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Option<AggregateQueueStatRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let val = self.query_as().fetch_optional(&mut *conn).await?;
-            Ok(val)
-        }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 1] {
+        [&self.queue_name]
     }
 }
 impl<'a> AggregateQueueStat<'a> {
@@ -1288,10 +1023,15 @@ impl<'a> AggregateQueueStatBuilder<'a, (&'a str,)> {
         AggregateQueueStat { queue_name }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct CleanJobsRow {
-    #[sqlx(rename = "id")]
-    pub id: sqlx::types::Uuid,
+    pub id: uuid::Uuid,
+}
+impl CleanJobsRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+        })
+    }
 }
 pub struct CleanJobs<'a> {
     job_status: TasukiJobStatus,
@@ -1304,30 +1044,28 @@ WHERE
   status = $1
   AND queue_name = $2
 RETURNING id";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        CleanJobsRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, CleanJobsRow>(Self::QUERY)
-            .bind(self.job_status)
-            .bind(self.queue_name)
+    pub async fn query_many(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<Vec<CleanJobsRow>, tokio_postgres::Error> {
+        let rows = client
+            .query(Self::QUERY, &[&self.job_status, &self.queue_name])
+            .await?;
+        rows.into_iter()
+            .map(|r| CleanJobsRow::from_row(&r))
+            .collect()
     }
-    pub fn query_many<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Vec<CleanJobsRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
+    pub async fn query_stream(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
+        Ok(st)
+    }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
+        [&self.job_status, &self.queue_name]
     }
 }
 impl<'a> CleanJobs<'a> {
@@ -1374,15 +1112,20 @@ impl<'a> CleanJobsBuilder<'a, (TasukiJobStatus, &'a str)> {
         }
     }
 }
-#[derive(sqlx::FromRow)]
 pub struct ListJobsRow {
-    #[sqlx(rename = "id")]
-    pub id: sqlx::types::Uuid,
-    #[sqlx(rename = "status")]
+    pub id: uuid::Uuid,
     pub status: TasukiJobStatus,
 }
+impl ListJobsRow {
+    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            status: row.try_get(1)?,
+        })
+    }
+}
 pub struct ListJobs<'a> {
-    cursor_job_id: Option<sqlx::types::Uuid>,
+    cursor_job_id: Option<uuid::Uuid>,
     queue_name: Option<&'a str>,
     page_size: i32,
 }
@@ -1417,31 +1160,31 @@ WHERE
   AND j.queue_name = $2
 ORDER BY j.created_at DESC, j.id DESC
 LIMIT $3";
-    pub fn query_as(
-        &'a self,
-    ) -> sqlx::query::QueryAs<
-        'a,
-        sqlx::Postgres,
-        ListJobsRow,
-        <sqlx::Postgres as sqlx::Database>::Arguments<'a>,
-    > {
-        sqlx::query_as::<_, ListJobsRow>(Self::QUERY)
-            .bind(self.cursor_job_id)
-            .bind(self.queue_name)
-            .bind(self.page_size)
+    pub async fn query_many(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<Vec<ListJobsRow>, tokio_postgres::Error> {
+        let rows = client
+            .query(
+                Self::QUERY,
+                &[&self.cursor_job_id, &self.queue_name, &self.page_size],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|r| ListJobsRow::from_row(&r))
+            .collect()
     }
-    pub fn query_many<'b, A>(
-        &'a self,
-        conn: A,
-    ) -> impl Future<Output = Result<Vec<ListJobsRow>, sqlx::Error>> + Send + 'a
-    where
-        A: sqlx::Acquire<'b, Database = sqlx::Postgres> + Send + 'a,
-    {
-        async move {
-            let mut conn = conn.acquire().await?;
-            let vals = self.query_as().fetch_all(&mut *conn).await?;
-            Ok(vals)
-        }
+    pub async fn query_stream(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
+        Ok(st)
+    }
+    pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
+        [&self.cursor_job_id, &self.queue_name, &self.page_size]
     }
 }
 impl<'a> ListJobs<'a> {
@@ -1459,8 +1202,8 @@ pub struct ListJobsBuilder<'a, Fields = ((), (), ())> {
 impl<'a, QueueName, PageSize> ListJobsBuilder<'a, ((), QueueName, PageSize)> {
     pub fn cursor_job_id(
         self,
-        cursor_job_id: Option<sqlx::types::Uuid>,
-    ) -> ListJobsBuilder<'a, (Option<sqlx::types::Uuid>, QueueName, PageSize)> {
+        cursor_job_id: Option<uuid::Uuid>,
+    ) -> ListJobsBuilder<'a, (Option<uuid::Uuid>, QueueName, PageSize)> {
         let ((), queue_name, page_size) = self.fields;
         let _phantom = self._phantom;
         ListJobsBuilder {
@@ -1492,7 +1235,7 @@ impl<'a, CursorJobId, QueueName> ListJobsBuilder<'a, (CursorJobId, QueueName, ()
         }
     }
 }
-impl<'a> ListJobsBuilder<'a, (Option<sqlx::types::Uuid>, Option<&'a str>, i32)> {
+impl<'a> ListJobsBuilder<'a, (Option<uuid::Uuid>, Option<&'a str>, i32)> {
     pub const fn build(self) -> ListJobs<'a> {
         let (cursor_job_id, queue_name, page_size) = self.fields;
         ListJobs {
