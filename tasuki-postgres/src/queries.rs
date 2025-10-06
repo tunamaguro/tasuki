@@ -730,7 +730,7 @@ impl<'a>
     }
 }
 pub struct AddJobNotifyRow {
-    pub pg_notify: (),
+    pub pg_notify: crate::PgVoid,
 }
 impl AddJobNotifyRow {
     pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {

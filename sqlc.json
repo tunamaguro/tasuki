@@ -24,7 +24,7 @@
                         "overrides": [
                             {
                                 "db_type": "void",
-                                "rs_type": "()",
+                                "rs_type": "crate::PgVoid",
                                 "copy_cheap": true
                             },
                             {
