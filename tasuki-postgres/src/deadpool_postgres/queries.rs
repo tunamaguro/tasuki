@@ -2,7 +2,7 @@
 //! sqlc version: v1.29.0
 //! sqlc-gen-rust version: v0.1.10
 
-use tokio_postgres::types::ToSql;
+use deadpool_postgres::tokio_postgres::types::ToSql;
 #[derive(Debug, Clone, Copy, postgres_types::ToSql, postgres_types::FromSql)]
 #[postgres(name = "tasuki_job_status")]
 pub enum TasukiJobStatus {
@@ -23,7 +23,9 @@ pub struct GetAvailableJobsRow {
     pub lease_token: uuid::Uuid,
 }
 impl GetAvailableJobsRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             id: row.try_get(0)?,
             job_data: row.try_get(1)?,
@@ -65,8 +67,8 @@ WHERE
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token";
     pub async fn query_many(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<Vec<GetAvailableJobsRow>, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<Vec<GetAvailableJobsRow>, deadpool_postgres::tokio_postgres::Error> {
         let rows = client
             .query(
                 Self::QUERY,
@@ -79,8 +81,11 @@ RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token";
     }
     pub async fn query_stream(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<
+        deadpool_postgres::tokio_postgres::RowStream,
+        deadpool_postgres::tokio_postgres::Error,
+    > {
         let st = client
             .query_raw(Self::QUERY, self.as_slice().into_iter())
             .await?;
@@ -155,7 +160,9 @@ pub struct HeartBeatJobRow {
     pub status: TasukiJobStatus,
 }
 impl HeartBeatJobRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             status: row.try_get(0)?,
         })
@@ -181,15 +188,15 @@ WHERE
 RETURNING j.status";
     pub async fn query_one(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<HeartBeatJobRow, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<HeartBeatJobRow, deadpool_postgres::tokio_postgres::Error> {
         let row = client.query_one(Self::QUERY, &self.as_slice()).await?;
         HeartBeatJobRow::from_row(&row)
     }
     pub async fn query_opt(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<Option<HeartBeatJobRow>, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<Option<HeartBeatJobRow>, deadpool_postgres::tokio_postgres::Error> {
         let row = client.query_opt(Self::QUERY, &self.as_slice()).await?;
         match row {
             Some(row) => Ok(Some(HeartBeatJobRow::from_row(&row)?)),
@@ -263,7 +270,9 @@ impl<'a> HeartBeatJobBuilder<'a, (crate::PgInterval, uuid::Uuid, Option<uuid::Uu
 }
 pub struct CompleteJobRow {}
 impl CompleteJobRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -281,8 +290,8 @@ WHERE
   AND lease_token = $2";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
@@ -332,7 +341,9 @@ impl<'a> CompleteJobBuilder<'a, (uuid::Uuid, Option<uuid::Uuid>)> {
 }
 pub struct CancelJobRow {}
 impl CancelJobRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -350,8 +361,8 @@ WHERE
   AND lease_token = $2";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
@@ -401,7 +412,9 @@ impl<'a> CancelJobBuilder<'a, (uuid::Uuid, Option<uuid::Uuid>)> {
 }
 pub struct RetryJobRow {}
 impl RetryJobRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -431,8 +444,8 @@ WHERE
   AND lease_token = $3";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
@@ -499,7 +512,9 @@ impl<'a> RetryJobBuilder<'a, (Option<crate::PgInterval>, uuid::Uuid, Option<uuid
 }
 pub struct InsertJobOneRow {}
 impl InsertJobOneRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -517,8 +532,8 @@ VALUES
   ($1, $2, $3, clock_timestamp() + $4::INTERVAL)";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 4] {
@@ -613,7 +628,9 @@ impl<'a> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::Pg
 }
 pub struct InsertJobManyRow {}
 impl InsertJobManyRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -733,7 +750,9 @@ pub struct AddJobNotifyRow {
     pub pg_notify: crate::PgVoid,
 }
 impl AddJobNotifyRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             pg_notify: row.try_get(0)?,
         })
@@ -750,8 +769,8 @@ impl<'a> AddJobNotify<'a> {
 )";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
@@ -807,7 +826,9 @@ impl<'a> AddJobNotifyBuilder<'a, (&'a str, &'a str)> {
 }
 pub struct CancelJobByIdRow {}
 impl CancelJobByIdRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -823,8 +844,8 @@ WHERE
   id = $1";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 1] {
@@ -861,7 +882,9 @@ impl<'a> CancelJobByIdBuilder<'a, (uuid::Uuid,)> {
 }
 pub struct RetryFailedByQueueRow {}
 impl RetryFailedByQueueRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {})
     }
 }
@@ -881,8 +904,8 @@ WHERE
   AND j.queue_name = $1::TEXT";
     pub async fn execute(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<u64, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<u64, deadpool_postgres::tokio_postgres::Error> {
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 1] {
@@ -925,7 +948,9 @@ pub struct AggregateQueueStatRow {
     pub canceled: i64,
 }
 impl AggregateQueueStatRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             pending: row.try_get(0)?,
             running: row.try_get(1)?,
@@ -976,15 +1001,15 @@ WHERE
   queue_name = $1";
     pub async fn query_one(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<AggregateQueueStatRow, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<AggregateQueueStatRow, deadpool_postgres::tokio_postgres::Error> {
         let row = client.query_one(Self::QUERY, &self.as_slice()).await?;
         AggregateQueueStatRow::from_row(&row)
     }
     pub async fn query_opt(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<Option<AggregateQueueStatRow>, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<Option<AggregateQueueStatRow>, deadpool_postgres::tokio_postgres::Error> {
         let row = client.query_opt(Self::QUERY, &self.as_slice()).await?;
         match row {
             Some(row) => Ok(Some(AggregateQueueStatRow::from_row(&row)?)),
@@ -1027,7 +1052,9 @@ pub struct CleanJobsRow {
     pub id: uuid::Uuid,
 }
 impl CleanJobsRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             id: row.try_get(0)?,
         })
@@ -1046,8 +1073,8 @@ WHERE
 RETURNING id";
     pub async fn query_many(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<Vec<CleanJobsRow>, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<Vec<CleanJobsRow>, deadpool_postgres::tokio_postgres::Error> {
         let rows = client
             .query(Self::QUERY, &[&self.job_status, &self.queue_name])
             .await?;
@@ -1057,8 +1084,11 @@ RETURNING id";
     }
     pub async fn query_stream(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<
+        deadpool_postgres::tokio_postgres::RowStream,
+        deadpool_postgres::tokio_postgres::Error,
+    > {
         let st = client
             .query_raw(Self::QUERY, self.as_slice().into_iter())
             .await?;
@@ -1117,7 +1147,9 @@ pub struct ListJobsRow {
     pub status: TasukiJobStatus,
 }
 impl ListJobsRow {
-    pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+    pub fn from_row(
+        row: &deadpool_postgres::tokio_postgres::Row,
+    ) -> Result<Self, deadpool_postgres::tokio_postgres::Error> {
         Ok(Self {
             id: row.try_get(0)?,
             status: row.try_get(1)?,
@@ -1162,8 +1194,8 @@ ORDER BY j.created_at DESC, j.id DESC
 LIMIT $3";
     pub async fn query_many(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<Vec<ListJobsRow>, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<Vec<ListJobsRow>, deadpool_postgres::tokio_postgres::Error> {
         let rows = client
             .query(
                 Self::QUERY,
@@ -1176,8 +1208,11 @@ LIMIT $3";
     }
     pub async fn query_stream(
         &self,
-        client: &impl tokio_postgres::GenericClient,
-    ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<
+        deadpool_postgres::tokio_postgres::RowStream,
+        deadpool_postgres::tokio_postgres::Error,
+    > {
         let st = client
             .query_raw(Self::QUERY, self.as_slice().into_iter())
             .await?;

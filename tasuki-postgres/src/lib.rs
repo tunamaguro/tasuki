@@ -1,5 +1,6 @@
-#[allow(unused, clippy::manual_async_fn)]
-mod queries;
+mod backend;
+mod deadpool_postgres;
+
 use bytes::{Buf, BufMut, BytesMut};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,14 +73,27 @@ impl postgres_types::ToSql for PgInterval {
     postgres_types::to_sql_checked!();
 }
 
-impl core::ops::Add for PgInterval {
+impl std::ops::Add for PgInterval {
     type Output = Self;
 
     fn add(mut self, rhs: Self) -> Self::Output {
         self.microseconds = self.microseconds.saturating_add(rhs.microseconds);
-        self.days = self.days.saturating_add(self.days);
-        self.months = self.months.saturating_add(self.months);
+        self.days = self.days.saturating_add(rhs.days);
+        self.months = self.months.saturating_add(rhs.months);
         self
+    }
+}
+
+impl TryFrom<std::time::Duration> for PgInterval {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: std::time::Duration) -> Result<Self, Self::Error> {
+        let microseconds = i64::try_from(value.as_micros())?;
+        Ok(PgInterval {
+            microseconds,
+            days: 0,
+            months: 0,
+        })
     }
 }
 

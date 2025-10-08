@@ -17,10 +17,10 @@
             "codegen": [
                 {
                     "plugin": "sqlc-gen-rust",
-                    "out": "tasuki-postgres/src/",
+                    "out": "tasuki-postgres/src/deadpool_postgres",
                     "options": {
                         "output": "queries.rs",
-                        "db_crate": "tokio-postgres",
+                        "db_crate": "deadpool-postgres",
                         "overrides": [
                             {
                                 "db_type": "void",
