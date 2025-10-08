@@ -252,15 +252,15 @@ async fn handle_one_job<F, M, Poller>(
     let (data, mut context) = job.split_parts();
     tracing::trace!("Start handler");
     let job_result = {
-        let heartbeat = context.heartbeat();
-        futures::pin_mut!(heartbeat);
         let handler_fut = handler.call(data, worker_context);
         futures::pin_mut!(handler_fut);
-
-        let mut heartbeat = heartbeat.fuse();
         let mut handler_fut = handler_fut.fuse();
 
         loop {
+            let heartbeat = context.heartbeat();
+            futures::pin_mut!(heartbeat);
+            let mut heartbeat = heartbeat.fuse();
+
             futures::select! {
                 res = handler_fut => break res,
                 res = heartbeat => {
