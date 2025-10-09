@@ -1,6 +1,7 @@
-use tasuki_core::{BackEndContext, BackEndDriver, backend::HeartbeatStop};
-
 use crate::backend::JobStatus;
+use futures::{StreamExt, TryStreamExt};
+use serde::de::DeserializeOwned;
+use tasuki_core::{BackEndContext, BackEndDriver, BackEndPoller, Job, backend::HeartbeatStop};
 
 use super::queries;
 
@@ -93,7 +94,7 @@ impl BackEndContext for OutTxContext {
                     tracing::warn!(job_id = %self.id, error = %error, retry_count, "failed to get client from pool; backing off");
                     let backoff = crate::backend::exponential_backoff(BACKOFF_BASE, retry_count)
                         .min(interval);
-                    tokio::time::sleep(backoff).await;
+                    crate::backend::sleep(backoff).await;
                     continue;
                 }
             };
@@ -116,7 +117,7 @@ impl BackEndContext for OutTxContext {
                     tracing::warn!(job_id = %self.id, error = %error, retry_count, "cannot heartbeat job; backing off");
                     let backoff = crate::backend::exponential_backoff(BACKOFF_BASE, retry_count)
                         .min(interval);
-                    tokio::time::sleep(backoff).await;
+                    crate::backend::sleep(backoff).await;
                     continue;
                 }
             };
@@ -125,7 +126,7 @@ impl BackEndContext for OutTxContext {
             match status {
                 JobStatus::Running => {
                     retry_count = 0;
-                    tokio::time::sleep(interval).await;
+                    crate::backend::sleep(interval).await;
                 }
                 JobStatus::Canceled => {
                     tracing::info!(job_id = %self.id, "job canceled");
@@ -196,5 +197,81 @@ impl BackEndContext for OutTxContext {
             });
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BackEnd<T> {
+    pool: deadpool_postgres::Pool,
+    queue_name: std::borrow::Cow<'static, str>,
+    lease_time: std::time::Duration,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> BackEnd<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    async fn poll_job_inner(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Vec<Result<Job<T, OutTxContext>, Error>>, Error> {
+        const DEFAULT_LEASE_TIME: crate::PgInterval = crate::PgInterval {
+            microseconds: 30 * 1000 * 1000,
+            days: 0,
+            months: 0,
+        };
+        let lease_interval =
+            crate::PgInterval::try_from(self.lease_time).unwrap_or(DEFAULT_LEASE_TIME);
+        let builder = queries::GetAvailableJobs::builder()
+            .lease_interval(lease_interval)
+            .queue_name(&self.queue_name)
+            .batch_size(i32::try_from(batch_size).unwrap_or(32))
+            .build();
+
+        let client = self.pool.get().await?;
+        let stmt = client
+            .prepare_cached(queries::GetAvailableJobs::QUERY)
+            .await?;
+        let st = client.query_raw(&stmt, builder.as_slice()).await?;
+        let row_st = st
+            .map_ok(|row| queries::GetAvailableJobsRow::from_row(&row))
+            .map(|res| res.flatten().map_err(Error::from));
+
+        let result = row_st
+            .map(|row| {
+                let row = row?;
+                let data = serde_json::from_value::<T>(row.job_data)?;
+                let context = OutTxContext {
+                    id: row.id,
+                    pool: self.pool.clone(),
+                    lease_token: row.lease_token,
+                    interval: self.lease_time,
+                    lease_interval,
+                };
+                Ok::<_, Error>(Job::from_parts(data, context))
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(result)
+    }
+}
+
+impl<T> BackEndPoller for BackEnd<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    type Driver = DeadPoolPostgresDriver;
+    type Data = T;
+    type Context = OutTxContext;
+    async fn poll_job(
+        &mut self,
+        batch_size: usize,
+    ) -> Vec<Result<Job<Self::Data, Self::Context>, <Self::Driver as BackEndDriver>::Error>> {
+        match self.poll_job_inner(batch_size).await {
+            Ok(v) => v,
+            Err(e) => vec![Err(e)],
+        }
     }
 }

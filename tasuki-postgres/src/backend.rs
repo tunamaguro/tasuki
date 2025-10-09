@@ -38,3 +38,17 @@ impl std::fmt::Display for LostLeaseError {
 }
 
 impl std::error::Error for LostLeaseError {}
+
+pub(crate) async fn sleep(duration: std::time::Duration) {
+    #[cfg(feature = "rt-tokio")]
+    {
+        tokio::time::sleep(duration).await;
+        return;
+    }
+
+    #[cfg(not(feature = "rt-tokio"))]
+    {
+        futures_timer::Delay::new(duration).await;
+        return;
+    }
+}

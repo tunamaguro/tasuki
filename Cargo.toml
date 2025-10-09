@@ -11,6 +11,7 @@ license = "Apache-2.0 OR MIT"
 futures = "0.3"
 pin-project-lite = "0.2"
 tracing = "0.1"
+futures-timer = "3.0"
 
 tasuki-core = { path = "./tasuki-core" }
 tasuki-sqlx = { path = "./tasuki-sqlx" }

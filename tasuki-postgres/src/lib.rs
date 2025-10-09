@@ -1,5 +1,5 @@
 mod backend;
-mod deadpool_postgres;
+pub mod deadpool_postgres;
 
 use bytes::{Buf, BufMut, BytesMut};
 
