@@ -1,4 +1,5 @@
 mod backend;
+mod client;
 #[allow(unused, clippy::manual_async_fn)]
 mod queries;
 

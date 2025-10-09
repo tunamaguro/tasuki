@@ -3,6 +3,9 @@ pub mod deadpool_postgres;
 
 use bytes::{Buf, BufMut, BytesMut};
 
+const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
+const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PgInterval {
     /// Number of microseconds
