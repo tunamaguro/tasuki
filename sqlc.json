@@ -15,6 +15,26 @@
             "queries": "./tasuki-sqlx/queries/",
             "engine": "postgresql",
             "codegen": [
+                 {
+                    "plugin": "sqlc-gen-rust",
+                    "out": "tasuki-postgres/src/tokio_postgres",
+                    "options": {
+                        "output": "queries.rs",
+                        "db_crate": "tokio-postgres",
+                        "overrides": [
+                            {
+                                "db_type": "void",
+                                "rs_type": "crate::PgVoid",
+                                "copy_cheap": true
+                            },
+                            {
+                                "db_type": "pg_catalog.interval",
+                                "rs_type": "crate::PgInterval",
+                                "copy_cheap": true
+                            }
+                        ]
+                    }
+                },
                 {
                     "plugin": "sqlc-gen-rust",
                     "out": "tasuki-postgres/src/deadpool_postgres",

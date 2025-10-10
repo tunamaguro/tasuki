@@ -5,15 +5,14 @@ use tasuki_core::{BackEndContext, BackEndDriver, BackEndPoller, Job, backend::He
 
 use super::queries;
 
-pub struct DeadPoolPostgresDriver;
-impl BackEndDriver for DeadPoolPostgresDriver {
+pub struct TokioPostgresDriver;
+impl BackEndDriver for TokioPostgresDriver {
     type Error = Error;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorKind {
     DataBase,
-    Pool,
     Decode,
     LostLease,
 }
@@ -51,15 +50,6 @@ impl From<tokio_postgres::Error> for Error {
     }
 }
 
-impl From<deadpool_postgres::PoolError> for Error {
-    fn from(value: deadpool_postgres::PoolError) -> Self {
-        Self {
-            kind: ErrorKind::Pool,
-            inner: Box::new(value),
-        }
-    }
-}
-
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self {
@@ -81,14 +71,15 @@ impl From<crate::backend::LostLeaseError> for Error {
 #[derive(Debug)]
 pub struct OutTxContext {
     id: uuid::Uuid,
-    pool: deadpool_postgres::Pool,
+    client: std::sync::Arc<tokio_postgres::Client>,
     lease_token: uuid::Uuid,
     interval: std::time::Duration,
     lease_interval: crate::PgInterval,
 }
 
 impl BackEndContext for OutTxContext {
-    type Driver = DeadPoolPostgresDriver;
+    type Driver = TokioPostgresDriver;
+
     async fn heartbeat(&mut self) -> HeartbeatStop {
         const BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -96,23 +87,12 @@ impl BackEndContext for OutTxContext {
         let mut retry_count = 0;
 
         loop {
-            let client = match self.pool.get().await {
-                Ok(client) => client,
-                Err(error) => {
-                    retry_count += 1;
-                    tracing::warn!(job_id = %self.id, error = %error, retry_count, "failed to get client from pool; backing off");
-                    let backoff = crate::backend::exponential_backoff(BACKOFF_BASE, retry_count)
-                        .min(interval);
-                    crate::backend::sleep(backoff).await;
-                    continue;
-                }
-            };
             let res = queries::HeartBeatJob::builder()
                 .lease_interval(self.lease_interval)
                 .id(self.id)
                 .lease_token(Some(self.lease_token))
                 .build()
-                .query_opt(&client)
+                .query_opt(self.client.as_ref())
                 .await;
 
             let row = match res {
@@ -150,12 +130,11 @@ impl BackEndContext for OutTxContext {
     }
 
     async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let client = self.pool.get().await?;
         let res = queries::CompleteJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
             .build()
-            .execute(&client)
+            .execute(self.client.as_ref())
             .await?;
 
         if res == 0 {
@@ -165,12 +144,11 @@ impl BackEndContext for OutTxContext {
     }
 
     async fn cancel(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let client = self.pool.get().await?;
         let res = queries::CancelJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
             .build()
-            .execute(&client)
+            .execute(self.client.as_ref())
             .await?;
 
         if res == 0 {
@@ -184,13 +162,12 @@ impl BackEndContext for OutTxContext {
         retry_after: Option<std::time::Duration>,
     ) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
         let retry_after = retry_after.and_then(|v| crate::PgInterval::try_from(v).ok());
-        let client = self.pool.get().await?;
         let res = queries::RetryJob::builder()
             .interval(retry_after)
             .id(self.id)
             .lease_token(Some(self.lease_token))
             .build()
-            .execute(&client)
+            .execute(self.client.as_ref())
             .await?;
 
         if res == 0 {
@@ -200,9 +177,8 @@ impl BackEndContext for OutTxContext {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct BackEnd<T> {
-    pool: deadpool_postgres::Pool,
+    client: std::sync::Arc<tokio_postgres::Client>,
     queue_name: std::borrow::Cow<'static, str>,
     lease_time: std::time::Duration,
     marker: std::marker::PhantomData<fn() -> T>,
@@ -212,9 +188,9 @@ impl<T> BackEnd<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
-    pub const fn new(pool: deadpool_postgres::Pool) -> Self {
+    pub const fn new(client: std::sync::Arc<tokio_postgres::Client>) -> Self {
         Self {
-            pool,
+            client,
             queue_name: std::borrow::Cow::Borrowed(crate::DEFAULT_QUEUE_NAME),
             marker: std::marker::PhantomData,
             lease_time: std::time::Duration::from_secs(30),
@@ -232,13 +208,12 @@ where
         };
         let lease_interval =
             crate::PgInterval::try_from(self.lease_time).unwrap_or(DEFAULT_LEASE_TIME);
-        let client = self.pool.get().await?;
         let st = queries::GetAvailableJobs::builder()
             .lease_interval(lease_interval)
             .queue_name(&self.queue_name)
             .batch_size(i32::try_from(batch_size).unwrap_or(32))
             .build()
-            .query_stream(&client)
+            .query_stream(self.client.as_ref())
             .await?;
 
         let row_st = st
@@ -251,7 +226,7 @@ where
                 let data = serde_json::from_value::<T>(row.job_data)?;
                 let context = OutTxContext {
                     id: row.id,
-                    pool: self.pool.clone(),
+                    client: self.client.clone(),
                     lease_token: row.lease_token,
                     interval: self.lease_time,
                     lease_interval,
@@ -269,9 +244,10 @@ impl<T> BackEndPoller for BackEnd<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
-    type Driver = DeadPoolPostgresDriver;
+    type Driver = TokioPostgresDriver;
     type Data = T;
     type Context = OutTxContext;
+
     async fn poll_job(
         &mut self,
         batch_size: usize,
