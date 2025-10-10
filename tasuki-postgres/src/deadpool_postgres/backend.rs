@@ -223,17 +223,15 @@ where
         };
         let lease_interval =
             crate::PgInterval::try_from(self.lease_time).unwrap_or(DEFAULT_LEASE_TIME);
-        let builder = queries::GetAvailableJobs::builder()
+        let client = self.pool.get().await?;
+        let st = queries::GetAvailableJobs::builder()
             .lease_interval(lease_interval)
             .queue_name(&self.queue_name)
             .batch_size(i32::try_from(batch_size).unwrap_or(32))
-            .build();
-
-        let client = self.pool.get().await?;
-        let stmt = client
-            .prepare_cached(queries::GetAvailableJobs::QUERY)
+            .build()
+            .query_stream(&client)
             .await?;
-        let st = client.query_raw(&stmt, builder.as_slice()).await?;
+
         let row_st = st
             .map_ok(|row| queries::GetAvailableJobsRow::from_row(&row))
             .map(|res| res.flatten().map_err(Error::from));

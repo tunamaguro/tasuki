@@ -139,13 +139,12 @@ where
     T: serde::Serialize + Sync,
 {
     async fn notify<C: deadpool_postgres::GenericClient>(&self, client: &C) -> Result<(), Error> {
-        let stmt = client.prepare_cached(queries::AddJobNotify::QUERY).await?;
-
-        let q = queries::AddJobNotify::builder()
+        queries::AddJobNotify::builder()
             .queue_name(&self.queue_name)
             .channel_name(crate::NOTIFY_CHANNEL_NAME)
-            .build();
-        client.execute(&stmt, &q.as_slice()).await?;
+            .build()
+            .execute(client)
+            .await?;
         Ok(())
     }
 
@@ -167,15 +166,14 @@ where
             )),
         })?;
 
-        let stmt = client.prepare_cached(queries::InsertJobOne::QUERY).await?;
-        let q = queries::InsertJobOne::builder()
+        queries::InsertJobOne::builder()
             .job_data(&value)
             .max_attempts(job.max_attempts.into())
             .queue_name(&self.queue_name)
             .interval(delay)
-            .build();
-
-        client.execute(&stmt, &q.as_slice()).await?;
+            .build()
+            .execute(client)
+            .await?;
 
         self.notify(client).await?;
 
@@ -225,9 +223,8 @@ where
         T: 'static,
     {
         let client = self.pool.get().await?;
-        let stmt = client.prepare_cached(queries::InsertJobMany::QUERY).await?;
 
-        let sink = client.copy_in(&stmt).await?;
+        let sink = client.copy_in(queries::InsertJobMany::QUERY).await?;
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);
         self.insert_jobs_copy_in(jobs, writer).await?;
 
@@ -246,9 +243,7 @@ where
         C: deadpool_postgres::GenericClient,
         T: 'job,
     {
-        let stmt = tx.prepare_cached(queries::InsertJobMany::QUERY).await?;
-
-        let sink = tx.copy_in(&stmt).await?;
+        let sink = tx.copy_in(queries::InsertJobMany::QUERY).await?;
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);
         self.insert_jobs_copy_in(jobs, writer).await?;
 
