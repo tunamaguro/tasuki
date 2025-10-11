@@ -13,28 +13,39 @@ async fn main() {
         .await
         .unwrap();
 
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     let backend = BackEnd::new(pool.clone());
     let worker = WorkerBuilder::new(std::time::Duration::from_secs(1))
         .handler(job_handler)
         .job_spawner(TokioSpawner)
-        .build(backend);
+        .build(backend)
+        .with_graceful_shutdown({
+            let token = cancel_token.clone();
+            token.cancelled_owned()
+        });
 
     let client = Client::<u64>::new(pool.clone());
-    let client_handle = async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-        let mut n = 0;
-        loop {
-            interval.tick().await;
-            let job = InsertJob::new(n);
-            match client.insert(&job).await {
-                Ok(_) => {
-                    tracing::info!("Enqueue job {}", n);
-                    n += 1
+    let client_handle = {
+        let token = cancel_token.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut n = 0;
+            loop {
+                if token.is_cancelled() {
+                    return;
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "Failed to enqueue job")
-                }
-            };
+                interval.tick().await;
+                let job = InsertJob::new(n);
+                match client.insert(&job).await {
+                    Ok(_) => {
+                        tracing::info!("Enqueue job {}", n);
+                        n += 1
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "Failed to enqueue job")
+                    }
+                };
+            }
         }
     };
 
@@ -42,6 +53,10 @@ async fn main() {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(client_handle);
     tasks.spawn(worker_fut);
+    tasks.spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        cancel_token.cancel();
+    });
 
     tasks.join_all().await;
 }

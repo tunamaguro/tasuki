@@ -15,3 +15,7 @@ futures-timer = "3.0"
 
 tasuki-core = { path = "./tasuki-core" }
 tasuki-sqlx = { path = "./tasuki-sqlx" }
+
+# for example only
+tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

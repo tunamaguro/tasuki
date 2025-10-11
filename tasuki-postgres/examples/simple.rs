@@ -21,32 +21,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     let client = std::sync::Arc::new(raw_client);
 
     let backend = BackEnd::<_, u64>::new(client.clone());
     let worker = WorkerBuilder::new(std::time::Duration::from_secs(1))
         .handler(job_handler)
         .job_spawner(TokioSpawner)
-        .build(backend);
+        .build(backend)
+        .with_graceful_shutdown(cancel_token.clone().cancelled_owned());
 
     let producer_client = Client::<_, u64>::new(client.clone());
 
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-        let mut n = 0u64;
-        loop {
-            interval.tick().await;
-            let job = InsertJob::new(n);
-            match producer_client.insert(&job).await {
-                Ok(()) => tracing::info!(job_id = n, "queued job"),
-                Err(error) => tracing::error!(%error, "failed to enqueue job"),
+    let client_fut = {
+        let token = cancel_token.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut n = 0u64;
+            loop {
+                if token.is_cancelled() {
+                    break;
+                }
+                interval.tick().await;
+                let job = InsertJob::new(n);
+                match producer_client.insert(&job).await {
+                    Ok(()) => tracing::info!(job_id = n, "queued job"),
+                    Err(error) => tracing::error!(%error, "failed to enqueue job"),
+                }
+                n = n.wrapping_add(1);
             }
-            n = n.wrapping_add(1);
         }
-    });
+    };
 
+    let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(worker.run());
+    tasks.spawn(client_fut);
+    tasks.spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        cancel_token.cancel();
+    });
 
     tasks.join_all().await;
 

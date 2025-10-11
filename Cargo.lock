@@ -1582,6 +1582,7 @@ dependencies = [
  "tasuki-core",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
