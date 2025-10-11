@@ -32,7 +32,7 @@ impl GetAvailableJobsRow {
     }
 }
 pub struct GetAvailableJobs<'a> {
-    lease_interval: crate::PgInterval,
+    lease_interval: crate::pg_type::PgInterval,
     queue_name: &'a str,
     batch_size: i32,
 }
@@ -73,13 +73,17 @@ RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token";
                 &[&self.lease_interval, &self.queue_name, &self.batch_size],
             )
             .await?;
-        rows.into_iter().map(|r| GetAvailableJobsRow::from_row(&r)).collect()
+        rows.into_iter()
+            .map(|r| GetAvailableJobsRow::from_row(&r))
+            .collect()
     }
     pub async fn query_stream(
         &self,
         client: &impl tokio_postgres::GenericClient,
     ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
-        let st = client.query_raw(Self::QUERY, self.as_slice().into_iter()).await?;
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
         Ok(st)
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
@@ -101,8 +105,8 @@ pub struct GetAvailableJobsBuilder<'a, Fields = ((), (), ())> {
 impl<'a, QueueName, BatchSize> GetAvailableJobsBuilder<'a, ((), QueueName, BatchSize)> {
     pub fn lease_interval(
         self,
-        lease_interval: crate::PgInterval,
-    ) -> GetAvailableJobsBuilder<'a, (crate::PgInterval, QueueName, BatchSize)> {
+        lease_interval: crate::pg_type::PgInterval,
+    ) -> GetAvailableJobsBuilder<'a, (crate::pg_type::PgInterval, QueueName, BatchSize)> {
         let ((), queue_name, batch_size) = self.fields;
         let _phantom = self._phantom;
         GetAvailableJobsBuilder {
@@ -111,11 +115,7 @@ impl<'a, QueueName, BatchSize> GetAvailableJobsBuilder<'a, ((), QueueName, Batch
         }
     }
 }
-impl<
-    'a,
-    LeaseInterval,
-    BatchSize,
-> GetAvailableJobsBuilder<'a, (LeaseInterval, (), BatchSize)> {
+impl<'a, LeaseInterval, BatchSize> GetAvailableJobsBuilder<'a, (LeaseInterval, (), BatchSize)> {
     pub fn queue_name(
         self,
         queue_name: &'a str,
@@ -128,11 +128,7 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    LeaseInterval,
-    QueueName,
-> GetAvailableJobsBuilder<'a, (LeaseInterval, QueueName, ())> {
+impl<'a, LeaseInterval, QueueName> GetAvailableJobsBuilder<'a, (LeaseInterval, QueueName, ())> {
     pub fn batch_size(
         self,
         batch_size: i32,
@@ -145,7 +141,7 @@ impl<
         }
     }
 }
-impl<'a> GetAvailableJobsBuilder<'a, (crate::PgInterval, &'a str, i32)> {
+impl<'a> GetAvailableJobsBuilder<'a, (crate::pg_type::PgInterval, &'a str, i32)> {
     pub const fn build(self) -> GetAvailableJobs<'a> {
         let (lease_interval, queue_name, batch_size) = self.fields;
         GetAvailableJobs {
@@ -160,11 +156,13 @@ pub struct HeartBeatJobRow {
 }
 impl HeartBeatJobRow {
     pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
-        Ok(Self { status: row.try_get(0)? })
+        Ok(Self {
+            status: row.try_get(0)?,
+        })
     }
 }
 pub struct HeartBeatJob {
-    lease_interval: crate::PgInterval,
+    lease_interval: crate::pg_type::PgInterval,
     id: uuid::Uuid,
     lease_token: Option<uuid::Uuid>,
 }
@@ -217,8 +215,8 @@ pub struct HeartBeatJobBuilder<'a, Fields = ((), (), ())> {
 impl<'a, Id, LeaseToken> HeartBeatJobBuilder<'a, ((), Id, LeaseToken)> {
     pub fn lease_interval(
         self,
-        lease_interval: crate::PgInterval,
-    ) -> HeartBeatJobBuilder<'a, (crate::PgInterval, Id, LeaseToken)> {
+        lease_interval: crate::pg_type::PgInterval,
+    ) -> HeartBeatJobBuilder<'a, (crate::pg_type::PgInterval, Id, LeaseToken)> {
         let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         HeartBeatJobBuilder {
@@ -227,11 +225,7 @@ impl<'a, Id, LeaseToken> HeartBeatJobBuilder<'a, ((), Id, LeaseToken)> {
         }
     }
 }
-impl<
-    'a,
-    LeaseInterval,
-    LeaseToken,
-> HeartBeatJobBuilder<'a, (LeaseInterval, (), LeaseToken)> {
+impl<'a, LeaseInterval, LeaseToken> HeartBeatJobBuilder<'a, (LeaseInterval, (), LeaseToken)> {
     pub fn id(
         self,
         id: uuid::Uuid,
@@ -257,7 +251,7 @@ impl<'a, LeaseInterval, Id> HeartBeatJobBuilder<'a, (LeaseInterval, Id, ())> {
         }
     }
 }
-impl<'a> HeartBeatJobBuilder<'a, (crate::PgInterval, uuid::Uuid, Option<uuid::Uuid>)> {
+impl<'a> HeartBeatJobBuilder<'a, (crate::pg_type::PgInterval, uuid::Uuid, Option<uuid::Uuid>)> {
     pub const fn build(self) -> HeartBeatJob {
         let (lease_interval, id, lease_token) = self.fields;
         HeartBeatJob {
@@ -412,7 +406,7 @@ impl RetryJobRow {
     }
 }
 pub struct RetryJob {
-    interval: Option<crate::PgInterval>,
+    interval: Option<crate::pg_type::PgInterval>,
     id: uuid::Uuid,
     lease_token: Option<uuid::Uuid>,
 }
@@ -460,8 +454,8 @@ pub struct RetryJobBuilder<'a, Fields = ((), (), ())> {
 impl<'a, Id, LeaseToken> RetryJobBuilder<'a, ((), Id, LeaseToken)> {
     pub fn interval(
         self,
-        interval: Option<crate::PgInterval>,
-    ) -> RetryJobBuilder<'a, (Option<crate::PgInterval>, Id, LeaseToken)> {
+        interval: Option<crate::pg_type::PgInterval>,
+    ) -> RetryJobBuilder<'a, (Option<crate::pg_type::PgInterval>, Id, LeaseToken)> {
         let ((), id, lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -471,10 +465,7 @@ impl<'a, Id, LeaseToken> RetryJobBuilder<'a, ((), Id, LeaseToken)> {
     }
 }
 impl<'a, Interval, LeaseToken> RetryJobBuilder<'a, (Interval, (), LeaseToken)> {
-    pub fn id(
-        self,
-        id: uuid::Uuid,
-    ) -> RetryJobBuilder<'a, (Interval, uuid::Uuid, LeaseToken)> {
+    pub fn id(self, id: uuid::Uuid) -> RetryJobBuilder<'a, (Interval, uuid::Uuid, LeaseToken)> {
         let (interval, (), lease_token) = self.fields;
         let _phantom = self._phantom;
         RetryJobBuilder {
@@ -496,9 +487,16 @@ impl<'a, Interval, Id> RetryJobBuilder<'a, (Interval, Id, ())> {
         }
     }
 }
-impl<
-    'a,
-> RetryJobBuilder<'a, (Option<crate::PgInterval>, uuid::Uuid, Option<uuid::Uuid>)> {
+impl<'a>
+    RetryJobBuilder<
+        'a,
+        (
+            Option<crate::pg_type::PgInterval>,
+            uuid::Uuid,
+            Option<uuid::Uuid>,
+        ),
+    >
+{
     pub const fn build(self) -> RetryJob {
         let (interval, id, lease_token) = self.fields;
         RetryJob {
@@ -518,7 +516,7 @@ pub struct InsertJobOne<'a> {
     max_attempts: i32,
     job_data: &'a serde_json::Value,
     queue_name: &'a str,
-    interval: crate::PgInterval,
+    interval: crate::pg_type::PgInterval,
 }
 impl<'a> InsertJobOne<'a> {
     pub const QUERY: &'static str = r"INSERT INTO
@@ -533,7 +531,12 @@ VALUES
         client.execute(Self::QUERY, &self.as_slice()).await
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 4] {
-        [&self.max_attempts, &self.job_data, &self.queue_name, &self.interval]
+        [
+            &self.max_attempts,
+            &self.job_data,
+            &self.queue_name,
+            &self.interval,
+        ]
     }
 }
 impl<'a> InsertJobOne<'a> {
@@ -548,12 +551,7 @@ pub struct InsertJobOneBuilder<'a, Fields = ((), (), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<
-    'a,
-    JobData,
-    QueueName,
-    Interval,
-> InsertJobOneBuilder<'a, ((), JobData, QueueName, Interval)> {
+impl<'a, JobData, QueueName, Interval> InsertJobOneBuilder<'a, ((), JobData, QueueName, Interval)> {
     pub fn max_attempts(
         self,
         max_attempts: i32,
@@ -566,19 +564,13 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    QueueName,
-    Interval,
-> InsertJobOneBuilder<'a, (MaxAttempts, (), QueueName, Interval)> {
+impl<'a, MaxAttempts, QueueName, Interval>
+    InsertJobOneBuilder<'a, (MaxAttempts, (), QueueName, Interval)>
+{
     pub fn job_data(
         self,
         job_data: &'a serde_json::Value,
-    ) -> InsertJobOneBuilder<
-        'a,
-        (MaxAttempts, &'a serde_json::Value, QueueName, Interval),
-    > {
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName, Interval)> {
         let (max_attempts, (), queue_name, interval) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
@@ -587,12 +579,9 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    JobData,
-    Interval,
-> InsertJobOneBuilder<'a, (MaxAttempts, JobData, (), Interval)> {
+impl<'a, MaxAttempts, JobData, Interval>
+    InsertJobOneBuilder<'a, (MaxAttempts, JobData, (), Interval)>
+{
     pub fn queue_name(
         self,
         queue_name: &'a str,
@@ -605,16 +594,14 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    JobData,
-    QueueName,
-> InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, ())> {
+impl<'a, MaxAttempts, JobData, QueueName>
+    InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, ())>
+{
     pub fn interval(
         self,
-        interval: crate::PgInterval,
-    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, crate::PgInterval)> {
+        interval: crate::pg_type::PgInterval,
+    ) -> InsertJobOneBuilder<'a, (MaxAttempts, JobData, QueueName, crate::pg_type::PgInterval)>
+    {
         let (max_attempts, job_data, queue_name, ()) = self.fields;
         let _phantom = self._phantom;
         InsertJobOneBuilder {
@@ -623,9 +610,17 @@ impl<
         }
     }
 }
-impl<
-    'a,
-> InsertJobOneBuilder<'a, (i32, &'a serde_json::Value, &'a str, crate::PgInterval)> {
+impl<'a>
+    InsertJobOneBuilder<
+        'a,
+        (
+            i32,
+            &'a serde_json::Value,
+            &'a str,
+            crate::pg_type::PgInterval,
+        ),
+    >
+{
     pub const fn build(self) -> InsertJobOne<'a> {
         let (max_attempts, job_data, queue_name, interval) = self.fields;
         InsertJobOne {
@@ -651,7 +646,12 @@ pub struct InsertJobMany<'a> {
 impl<'a> InsertJobMany<'a> {
     pub const QUERY: &'static str = r"COPY tasuki_job (max_attempts,job_data,queue_name,scheduled_at) FROM STDIN (FORMAT BINARY)";
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 4] {
-        [&self.max_attempts, &self.job_data, &self.queue_name, &self.scheduled_at]
+        [
+            &self.max_attempts,
+            &self.job_data,
+            &self.queue_name,
+            &self.scheduled_at,
+        ]
     }
 }
 impl<'a> InsertJobMany<'a> {
@@ -666,12 +666,9 @@ pub struct InsertJobManyBuilder<'a, Fields = ((), (), (), ())> {
     fields: Fields,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
-impl<
-    'a,
-    JobData,
-    QueueName,
-    ScheduledAt,
-> InsertJobManyBuilder<'a, ((), JobData, QueueName, ScheduledAt)> {
+impl<'a, JobData, QueueName, ScheduledAt>
+    InsertJobManyBuilder<'a, ((), JobData, QueueName, ScheduledAt)>
+{
     pub fn max_attempts(
         self,
         max_attempts: i32,
@@ -684,19 +681,14 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    QueueName,
-    ScheduledAt,
-> InsertJobManyBuilder<'a, (MaxAttempts, (), QueueName, ScheduledAt)> {
+impl<'a, MaxAttempts, QueueName, ScheduledAt>
+    InsertJobManyBuilder<'a, (MaxAttempts, (), QueueName, ScheduledAt)>
+{
     pub fn job_data(
         self,
         job_data: &'a serde_json::Value,
-    ) -> InsertJobManyBuilder<
-        'a,
-        (MaxAttempts, &'a serde_json::Value, QueueName, ScheduledAt),
-    > {
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, &'a serde_json::Value, QueueName, ScheduledAt)>
+    {
         let (max_attempts, (), queue_name, scheduled_at) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
@@ -705,12 +697,9 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    JobData,
-    ScheduledAt,
-> InsertJobManyBuilder<'a, (MaxAttempts, JobData, (), ScheduledAt)> {
+impl<'a, MaxAttempts, JobData, ScheduledAt>
+    InsertJobManyBuilder<'a, (MaxAttempts, JobData, (), ScheduledAt)>
+{
     pub fn queue_name(
         self,
         queue_name: &'a str,
@@ -723,19 +712,14 @@ impl<
         }
     }
 }
-impl<
-    'a,
-    MaxAttempts,
-    JobData,
-    QueueName,
-> InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, ())> {
+impl<'a, MaxAttempts, JobData, QueueName>
+    InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, ())>
+{
     pub fn scheduled_at(
         self,
         scheduled_at: &'a std::time::SystemTime,
-    ) -> InsertJobManyBuilder<
-        'a,
-        (MaxAttempts, JobData, QueueName, &'a std::time::SystemTime),
-    > {
+    ) -> InsertJobManyBuilder<'a, (MaxAttempts, JobData, QueueName, &'a std::time::SystemTime)>
+    {
         let (max_attempts, job_data, queue_name, ()) = self.fields;
         let _phantom = self._phantom;
         InsertJobManyBuilder {
@@ -744,12 +728,17 @@ impl<
         }
     }
 }
-impl<
-    'a,
-> InsertJobManyBuilder<
-    'a,
-    (i32, &'a serde_json::Value, &'a str, &'a std::time::SystemTime),
-> {
+impl<'a>
+    InsertJobManyBuilder<
+        'a,
+        (
+            i32,
+            &'a serde_json::Value,
+            &'a str,
+            &'a std::time::SystemTime,
+        ),
+    >
+{
     pub const fn build(self) -> InsertJobMany<'a> {
         let (max_attempts, job_data, queue_name, scheduled_at) = self.fields;
         InsertJobMany {
@@ -761,11 +750,13 @@ impl<
     }
 }
 pub struct AddJobNotifyRow {
-    pub pg_notify: crate::PgVoid,
+    pub pg_notify: crate::pg_type::PgVoid,
 }
 impl AddJobNotifyRow {
     pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
-        Ok(Self { pg_notify: row.try_get(0)? })
+        Ok(Self {
+            pg_notify: row.try_get(0)?,
+        })
     }
 }
 pub struct AddJobNotify<'a> {
@@ -931,10 +922,7 @@ pub struct RetryFailedByQueueBuilder<'a, Fields = ((),)> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a> RetryFailedByQueueBuilder<'a, ((),)> {
-    pub fn queue_name(
-        self,
-        queue_name: &'a str,
-    ) -> RetryFailedByQueueBuilder<'a, (&'a str,)> {
+    pub fn queue_name(self, queue_name: &'a str) -> RetryFailedByQueueBuilder<'a, (&'a str,)> {
         let ((),) = self.fields;
         let _phantom = self._phantom;
         RetryFailedByQueueBuilder {
@@ -1040,10 +1028,7 @@ pub struct AggregateQueueStatBuilder<'a, Fields = ((),)> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 impl<'a> AggregateQueueStatBuilder<'a, ((),)> {
-    pub fn queue_name(
-        self,
-        queue_name: &'a str,
-    ) -> AggregateQueueStatBuilder<'a, (&'a str,)> {
+    pub fn queue_name(self, queue_name: &'a str) -> AggregateQueueStatBuilder<'a, (&'a str,)> {
         let ((),) = self.fields;
         let _phantom = self._phantom;
         AggregateQueueStatBuilder {
@@ -1063,7 +1048,9 @@ pub struct CleanJobsRow {
 }
 impl CleanJobsRow {
     pub fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
-        Ok(Self { id: row.try_get(0)? })
+        Ok(Self {
+            id: row.try_get(0)?,
+        })
     }
 }
 pub struct CleanJobs<'a> {
@@ -1084,13 +1071,17 @@ RETURNING id";
         let rows = client
             .query(Self::QUERY, &[&self.job_status, &self.queue_name])
             .await?;
-        rows.into_iter().map(|r| CleanJobsRow::from_row(&r)).collect()
+        rows.into_iter()
+            .map(|r| CleanJobsRow::from_row(&r))
+            .collect()
     }
     pub async fn query_stream(
         &self,
         client: &impl tokio_postgres::GenericClient,
     ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
-        let st = client.query_raw(Self::QUERY, self.as_slice().into_iter()).await?;
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
         Ok(st)
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 2] {
@@ -1123,10 +1114,7 @@ impl<'a, QueueName> CleanJobsBuilder<'a, ((), QueueName)> {
     }
 }
 impl<'a, JobStatus> CleanJobsBuilder<'a, (JobStatus, ())> {
-    pub fn queue_name(
-        self,
-        queue_name: &'a str,
-    ) -> CleanJobsBuilder<'a, (JobStatus, &'a str)> {
+    pub fn queue_name(self, queue_name: &'a str) -> CleanJobsBuilder<'a, (JobStatus, &'a str)> {
         let (job_status, ()) = self.fields;
         let _phantom = self._phantom;
         CleanJobsBuilder {
@@ -1202,13 +1190,17 @@ LIMIT $3";
                 &[&self.cursor_job_id, &self.queue_name, &self.page_size],
             )
             .await?;
-        rows.into_iter().map(|r| ListJobsRow::from_row(&r)).collect()
+        rows.into_iter()
+            .map(|r| ListJobsRow::from_row(&r))
+            .collect()
     }
     pub async fn query_stream(
         &self,
         client: &impl tokio_postgres::GenericClient,
     ) -> Result<tokio_postgres::RowStream, tokio_postgres::Error> {
-        let st = client.query_raw(Self::QUERY, self.as_slice().into_iter()).await?;
+        let st = client
+            .query_raw(Self::QUERY, self.as_slice().into_iter())
+            .await?;
         Ok(st)
     }
     pub fn as_slice(&self) -> [&(dyn ToSql + Sync); 3] {
@@ -1254,10 +1246,7 @@ impl<'a, CursorJobId, PageSize> ListJobsBuilder<'a, (CursorJobId, (), PageSize)>
     }
 }
 impl<'a, CursorJobId, QueueName> ListJobsBuilder<'a, (CursorJobId, QueueName, ())> {
-    pub fn page_size(
-        self,
-        page_size: i32,
-    ) -> ListJobsBuilder<'a, (CursorJobId, QueueName, i32)> {
+    pub fn page_size(self, page_size: i32) -> ListJobsBuilder<'a, (CursorJobId, QueueName, i32)> {
         let (cursor_job_id, queue_name, ()) = self.fields;
         let _phantom = self._phantom;
         ListJobsBuilder {

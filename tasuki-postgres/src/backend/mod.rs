@@ -1,3 +1,7 @@
+mod backend_impl;
+
+pub use backend_impl::{BackEnd, Error, ErrorKind, OutTxContext, PostgresDriver};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum JobStatus {
     Pending,
@@ -15,6 +19,30 @@ impl JobStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
+        }
+    }
+}
+
+impl From<crate::queries::TasukiJobStatus> for JobStatus {
+    fn from(value: crate::queries::TasukiJobStatus) -> Self {
+        match value {
+            crate::queries::TasukiJobStatus::Pending => JobStatus::Pending,
+            crate::queries::TasukiJobStatus::Running => JobStatus::Running,
+            crate::queries::TasukiJobStatus::Completed => JobStatus::Completed,
+            crate::queries::TasukiJobStatus::Failed => JobStatus::Failed,
+            crate::queries::TasukiJobStatus::Canceled => JobStatus::Canceled,
+        }
+    }
+}
+
+impl From<JobStatus> for crate::queries::TasukiJobStatus {
+    fn from(value: JobStatus) -> Self {
+        match value {
+            JobStatus::Pending => crate::queries::TasukiJobStatus::Pending,
+            JobStatus::Running => crate::queries::TasukiJobStatus::Running,
+            JobStatus::Completed => crate::queries::TasukiJobStatus::Completed,
+            JobStatus::Failed => crate::queries::TasukiJobStatus::Failed,
+            JobStatus::Canceled => crate::queries::TasukiJobStatus::Canceled,
         }
     }
 }

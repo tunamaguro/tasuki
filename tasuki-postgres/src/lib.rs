@@ -1,189 +1,81 @@
-mod backend;
-pub mod deadpool_postgres;
-pub mod tokio_postgres;
+pub mod backend;
+pub mod client;
+mod pg_type;
 
-use bytes::{Buf, BufMut, BytesMut};
+#[allow(unused, clippy::manual_async_fn)]
+mod queries;
 
 const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
 const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";
 
-pub struct InsertJob<T> {
-    data: T,
-    max_attempts: u16,
-    delay: std::time::Duration,
+pub trait ClientAccess: Clone + Send + Sync + 'static {
+    type Handle<'a>: std::ops::Deref<Target = ::tokio_postgres::Client> + Send
+    where
+        Self: 'a;
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Fut<'a>: std::future::Future<Output = Result<Self::Handle<'a>, Self::Error>> + Send
+    where
+        Self: 'a;
+
+    fn client<'a>(&'a self) -> Self::Fut<'a>;
 }
 
-impl<T> InsertJob<T> {
-    const DEFAULT_MAX_ATTEMPTS: u16 = 25;
+impl ClientAccess for std::sync::Arc<::tokio_postgres::Client> {
+    type Handle<'a>
+        = &'a ::tokio_postgres::Client
+    where
+        Self: 'a;
+    type Error = std::convert::Infallible;
+    type Fut<'a>
+        = std::future::Ready<Result<Self::Handle<'a>, Self::Error>>
+    where
+        Self: 'a;
 
-    pub const fn new(data: T) -> Self {
-        Self {
-            data,
-            max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
-            delay: std::time::Duration::from_secs(0),
-        }
-    }
-
-    pub fn max_attempts(self, max_attempts: u16) -> Self {
-        Self {
-            max_attempts,
-            ..self
-        }
-    }
-
-    pub fn delay(self, delay: std::time::Duration) -> Self {
-        Self { delay, ..self }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.data
+    fn client<'a>(&'a self) -> Self::Fut<'a> {
+        std::future::ready(Ok(self.as_ref()))
     }
 }
 
-impl<T> From<T> for InsertJob<T> {
-    fn from(value: T) -> Self {
-        InsertJob::new(value)
+impl ClientAccess for std::sync::Arc<tokio::sync::Mutex<::tokio_postgres::Client>> {
+    type Handle<'a>
+        = tokio::sync::MutexGuard<'a, ::tokio_postgres::Client>
+    where
+        Self: 'a;
+    type Error = std::convert::Infallible;
+    type Fut<'a>
+        = futures::future::BoxFuture<'a, Result<Self::Handle<'a>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn client<'a>(&'a self) -> Self::Fut<'a> {
+        Box::pin(async move { Ok(self.lock().await) })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PgInterval {
-    /// Number of microseconds
-    pub microseconds: i64,
-    /// Number of days
-    pub days: i32,
-    /// Number of months
-    pub months: i32,
+pub struct DeadPoolObjectWrapper(pub deadpool_postgres::Object);
+
+impl std::ops::Deref for DeadPoolObjectWrapper {
+    type Target = ::tokio_postgres::Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl<'q> postgres_types::FromSql<'q> for PgInterval {
-    fn from_sql(
-        ty: &postgres_types::Type,
-        raw: &'q [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if !Self::accepts(ty) {
-            return Err(format!("expected INTERVAL, got {ty}").into());
-        }
-
-        const EXPECTED_BUFFER_SIZE: usize = 16; // i64 + i32 x 2
-        let mut buf = raw;
-        if buf.len() != EXPECTED_BUFFER_SIZE {
-            return Err("Invalid buffer size".into());
-        }
-
-        let microseconds = buf.get_i64();
-        let days = buf.get_i32();
-        let months = buf.get_i32();
-
-        Ok(Self {
-            microseconds,
-            days,
-            months,
+impl ClientAccess for deadpool_postgres::Pool {
+    type Handle<'a>
+        = DeadPoolObjectWrapper
+    where
+        Self: 'a;
+    type Error = deadpool_postgres::PoolError;
+    type Fut<'a>
+        = futures::future::BoxFuture<'a, Result<Self::Handle<'a>, Self::Error>>
+    where
+        Self: 'a;
+    fn client<'a>(&'a self) -> Self::Fut<'a> {
+        Box::pin(async move {
+            let obj = self.get().await?;
+            Ok(DeadPoolObjectWrapper(obj))
         })
     }
-
-    fn accepts(ty: &postgres_types::Type) -> bool {
-        ty == &postgres_types::Type::INTERVAL
-    }
-}
-
-impl postgres_types::ToSql for PgInterval {
-    fn to_sql(
-        &self,
-        ty: &postgres_types::Type,
-        out: &mut BytesMut,
-    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        if !Self::accepts(ty) {
-            return Err(format!("expected INTERVAL, got {ty}").into());
-        }
-
-        out.put_i64(self.microseconds);
-        out.put_i32(self.days);
-        out.put_i32(self.months);
-        Ok(postgres_types::IsNull::No)
-    }
-
-    fn accepts(ty: &postgres_types::Type) -> bool
-    where
-        Self: Sized,
-    {
-        ty == &postgres_types::Type::INTERVAL
-    }
-
-    postgres_types::to_sql_checked!();
-}
-
-impl std::ops::Add for PgInterval {
-    type Output = Self;
-
-    fn add(mut self, rhs: Self) -> Self::Output {
-        self.microseconds = self.microseconds.saturating_add(rhs.microseconds);
-        self.days = self.days.saturating_add(rhs.days);
-        self.months = self.months.saturating_add(rhs.months);
-        self
-    }
-}
-
-impl TryFrom<std::time::Duration> for PgInterval {
-    type Error = std::num::TryFromIntError;
-
-    fn try_from(value: std::time::Duration) -> Result<Self, Self::Error> {
-        let microseconds = i64::try_from(value.as_micros())?;
-        Ok(PgInterval {
-            microseconds,
-            days: 0,
-            months: 0,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PgVoid;
-
-impl<'q> postgres_types::FromSql<'q> for PgVoid {
-    fn from_sql(
-        ty: &postgres_types::Type,
-        raw: &'q [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if !Self::accepts(ty) {
-            return Err(format!("expected VOID, got {ty}").into());
-        }
-        if raw.len() != 0 {
-            return Err("Invalid buffer size".into());
-        }
-
-        Ok(PgVoid)
-    }
-
-    fn accepts(ty: &postgres_types::Type) -> bool {
-        ty == &postgres_types::Type::VOID
-    }
-}
-
-impl postgres_types::ToSql for PgVoid {
-    fn to_sql(
-        &self,
-        ty: &postgres_types::Type,
-        _out: &mut BytesMut,
-    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        if !Self::accepts(ty) {
-            return Err(format!("expected VOID, got {ty}").into());
-        }
-        Ok(postgres_types::IsNull::No)
-    }
-
-    fn accepts(ty: &postgres_types::Type) -> bool
-    where
-        Self: Sized,
-    {
-        ty == &postgres_types::Type::VOID
-    }
-
-    postgres_types::to_sql_checked!();
 }

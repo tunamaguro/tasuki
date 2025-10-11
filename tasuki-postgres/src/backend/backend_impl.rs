@@ -1,18 +1,18 @@
-use crate::backend::JobStatus;
-use futures::{StreamExt, TryStreamExt};
-use serde::de::DeserializeOwned;
+use futures::{StreamExt as _, TryStreamExt as _};
 use tasuki_core::{BackEndContext, BackEndDriver, BackEndPoller, Job, backend::HeartbeatStop};
 
-use super::{ClientAccess, queries};
+use super::JobStatus;
+use crate::{ClientAccess, queries};
 
-pub struct TokioPostgresDriver;
-impl BackEndDriver for TokioPostgresDriver {
+pub struct PostgresDriver;
+impl BackEndDriver for PostgresDriver {
     type Error = Error;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorKind {
     DataBase,
+    ClientPool,
     Decode,
     LostLease,
 }
@@ -59,8 +59,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<crate::backend::LostLeaseError> for Error {
-    fn from(value: crate::backend::LostLeaseError) -> Self {
+impl From<super::LostLeaseError> for Error {
+    fn from(value: super::LostLeaseError) -> Self {
         Self {
             kind: ErrorKind::LostLease,
             inner: Box::new(value),
@@ -68,20 +68,31 @@ impl From<crate::backend::LostLeaseError> for Error {
     }
 }
 
+trait ClientAccessExt: ClientAccess {
+    async fn get_handle(&self) -> Result<Self::Handle<'_>, Error> {
+        self.client().await.map_err(|e| Error {
+            kind: ErrorKind::ClientPool,
+            inner: Box::new(e),
+        })
+    }
+}
+
+impl<T> ClientAccessExt for T where T: ClientAccess {}
+
 #[derive(Debug)]
 pub struct OutTxContext<C> {
     id: uuid::Uuid,
     client: C,
     lease_token: uuid::Uuid,
     interval: std::time::Duration,
-    lease_interval: crate::PgInterval,
+    lease_interval: crate::pg_type::PgInterval,
 }
 
 impl<C> BackEndContext for OutTxContext<C>
 where
     C: ClientAccess,
 {
-    type Driver = TokioPostgresDriver;
+    type Driver = PostgresDriver;
 
     async fn heartbeat(&mut self) -> HeartbeatStop {
         const BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -91,7 +102,17 @@ where
 
         loop {
             let res = {
-                let handle = self.client.client().await;
+                let handle = match self.client.get_handle().await {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        retry_count += 1;
+                        tracing::warn!(job_id = %self.id, error = %error, retry_count, "failed to get client; backing off");
+                        let backoff =
+                            super::exponential_backoff(BACKOFF_BASE, retry_count).min(interval);
+                        super::sleep(backoff).await;
+                        continue;
+                    }
+                };
                 queries::HeartBeatJob::builder()
                     .lease_interval(self.lease_interval)
                     .id(self.id)
@@ -136,7 +157,7 @@ where
     }
 
     async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let handle = self.client.client().await;
+        let handle = self.client.get_handle().await?;
         let res = queries::CompleteJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
@@ -151,7 +172,7 @@ where
     }
 
     async fn cancel(self) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let handle = self.client.client().await;
+        let handle = self.client.get_handle().await?;
         let res = queries::CancelJob::builder()
             .id(self.id)
             .lease_token(Some(self.lease_token))
@@ -169,8 +190,8 @@ where
         self,
         retry_after: Option<std::time::Duration>,
     ) -> Result<(), <Self::Driver as BackEndDriver>::Error> {
-        let handle = self.client.client().await;
-        let retry_after = retry_after.and_then(|v| crate::PgInterval::try_from(v).ok());
+        let handle = self.client.get_handle().await?;
+        let retry_after = retry_after.and_then(|v| crate::pg_type::PgInterval::try_from(v).ok());
         let res = queries::RetryJob::builder()
             .interval(retry_after)
             .id(self.id)
@@ -186,6 +207,7 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct BackEnd<C, T> {
     client: C,
     queue_name: std::borrow::Cow<'static, str>,
@@ -196,7 +218,7 @@ pub struct BackEnd<C, T> {
 impl<C, T> BackEnd<C, T>
 where
     C: ClientAccess,
-    T: DeserializeOwned + Send + 'static,
+    T: serde::de::DeserializeOwned + Send,
 {
     pub const fn new(client: C) -> Self {
         Self {
@@ -207,18 +229,25 @@ where
         }
     }
 
+    async fn get_handle(&self) -> Result<C::Handle<'_>, Error> {
+        self.client.client().await.map_err(|e| Error {
+            kind: ErrorKind::ClientPool,
+            inner: Box::new(e),
+        })
+    }
+
     async fn poll_job_inner(
         &mut self,
         batch_size: usize,
     ) -> Result<Vec<Result<Job<T, OutTxContext<C>>, Error>>, Error> {
-        const DEFAULT_LEASE_TIME: crate::PgInterval = crate::PgInterval {
+        const DEFAULT_LEASE_TIME: crate::pg_type::PgInterval = crate::pg_type::PgInterval {
             microseconds: 30 * 1000 * 1000,
             days: 0,
             months: 0,
         };
         let lease_interval =
-            crate::PgInterval::try_from(self.lease_time).unwrap_or(DEFAULT_LEASE_TIME);
-        let handle = self.client.client().await;
+            crate::pg_type::PgInterval::try_from(self.lease_time).unwrap_or(DEFAULT_LEASE_TIME);
+        let handle = self.get_handle().await?;
         let st = queries::GetAvailableJobs::builder()
             .lease_interval(lease_interval)
             .queue_name(&self.queue_name)
@@ -254,12 +283,11 @@ where
 impl<C, T> BackEndPoller for BackEnd<C, T>
 where
     C: ClientAccess,
-    T: DeserializeOwned + Send + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
 {
-    type Driver = TokioPostgresDriver;
+    type Driver = PostgresDriver;
     type Data = T;
     type Context = OutTxContext<C>;
-
     async fn poll_job(
         &mut self,
         batch_size: usize,

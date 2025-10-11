@@ -17,39 +17,19 @@
             "codegen": [
                  {
                     "plugin": "sqlc-gen-rust",
-                    "out": "tasuki-postgres/src/tokio_postgres",
+                    "out": "tasuki-postgres/src/",
                     "options": {
                         "output": "queries.rs",
                         "db_crate": "tokio-postgres",
                         "overrides": [
                             {
                                 "db_type": "void",
-                                "rs_type": "crate::PgVoid",
+                                "rs_type": "crate::pg_type::PgVoid",
                                 "copy_cheap": true
                             },
                             {
                                 "db_type": "pg_catalog.interval",
-                                "rs_type": "crate::PgInterval",
-                                "copy_cheap": true
-                            }
-                        ]
-                    }
-                },
-                {
-                    "plugin": "sqlc-gen-rust",
-                    "out": "tasuki-postgres/src/deadpool_postgres",
-                    "options": {
-                        "output": "queries.rs",
-                        "db_crate": "deadpool-postgres",
-                        "overrides": [
-                            {
-                                "db_type": "void",
-                                "rs_type": "crate::PgVoid",
-                                "copy_cheap": true
-                            },
-                            {
-                                "db_type": "pg_catalog.interval",
-                                "rs_type": "crate::PgInterval",
+                                "rs_type": "crate::pg_type::PgInterval",
                                 "copy_cheap": true
                             }
                         ]
