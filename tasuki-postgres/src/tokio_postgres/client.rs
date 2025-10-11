@@ -1,10 +1,9 @@
-use super::queries;
-use crate::InsertJob;
+use super::{ClientAccess, queries};
+use crate::{InsertJob, tokio_postgres::client};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorKind {
     DataBase,
-    Pool,
     Encode,
 }
 
@@ -31,7 +30,6 @@ impl std::error::Error for Error {
         Some(self.inner.as_ref())
     }
 }
-
 impl From<tokio_postgres::Error> for Error {
     fn from(value: tokio_postgres::Error) -> Self {
         Self {
@@ -40,16 +38,6 @@ impl From<tokio_postgres::Error> for Error {
         }
     }
 }
-
-impl From<deadpool_postgres::PoolError> for Error {
-    fn from(value: deadpool_postgres::PoolError) -> Self {
-        Self {
-            kind: ErrorKind::Pool,
-            inner: Box::new(value),
-        }
-    }
-}
-
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self {
@@ -59,29 +47,22 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[derive(Debug)]
-pub struct Client<T> {
-    pool: deadpool_postgres::Pool,
+#[derive(Debug, Clone)]
+pub struct Client<C, T> {
+    client: C,
     queue_name: std::borrow::Cow<'static, str>,
-    data_type: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T> Clone for Client<T> {
-    fn clone(&self) -> Self {
+impl<C, T> Client<C, T>
+where
+    C: ClientAccess,
+{
+    pub fn new(client: C) -> Self {
         Self {
-            pool: self.pool.clone(),
-            queue_name: self.queue_name.clone(),
-            data_type: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T> Client<T> {
-    pub fn new(pool: deadpool_postgres::Pool) -> Self {
-        Self {
-            pool,
+            client,
             queue_name: crate::DEFAULT_QUEUE_NAME.into(),
-            data_type: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 
@@ -96,11 +77,15 @@ impl<T> Client<T> {
     }
 }
 
-impl<T> Client<T>
+impl<C, T> Client<C, T>
 where
-    T: serde::Serialize + Sync,
+    C: ClientAccess,
+    T: serde::Serialize,
 {
-    async fn notify<C: deadpool_postgres::GenericClient>(&self, client: &C) -> Result<(), Error> {
+    async fn notify<U>(&self, client: &U) -> Result<(), Error>
+    where
+        U: tokio_postgres::GenericClient,
+    {
         queries::AddJobNotify::builder()
             .queue_name(&self.queue_name)
             .channel_name(crate::NOTIFY_CHANNEL_NAME)
@@ -110,14 +95,14 @@ where
         Ok(())
     }
 
-    pub async fn insert(&self, job: InsertJob<T>) -> Result<(), Error> {
-        let client = self.pool.get().await?;
-        self.insert_tx(job, &client).await
+    pub async fn insert(&self, job: &InsertJob<T>) -> Result<(), Error> {
+        let client = self.client.client().await;
+        self.insert_tx(job, &*client).await
     }
 
-    pub async fn insert_tx<C>(&self, job: InsertJob<T>, client: &C) -> Result<(), Error>
+    pub async fn insert_tx<U>(&self, job: &InsertJob<T>, client: &U) -> Result<(), Error>
     where
-        C: deadpool_postgres::GenericClient,
+        U: tokio_postgres::GenericClient,
     {
         let value = serde_json::to_value(&job.data)?;
         let delay = crate::PgInterval::try_from(job.delay).map_err(|_| Error {
@@ -142,20 +127,21 @@ where
         Ok(())
     }
 
-    async fn insert_jobs_copy_in<'job, I>(
+    async fn insert_jobs_copy_in<I, Job>(
         &self,
         jobs: I,
         writer: tokio_postgres::binary_copy::BinaryCopyInWriter,
     ) -> Result<(), Error>
     where
-        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I: IntoIterator<Item = Job> + Send,
         I::IntoIter: Send,
-        T: 'job,
+        Job: AsRef<InsertJob<T>> + Send,
     {
         let now = std::time::SystemTime::now();
 
         futures::pin_mut!(writer);
         for job in jobs {
+            let job = job.as_ref();
             let value = serde_json::to_value(&job.data)?;
             let scheduled_at = now + job.delay;
             let q = queries::InsertJobMany::builder()
@@ -178,32 +164,30 @@ where
         tokio_postgres::types::Type::TIMESTAMPTZ,
     ];
 
-    pub async fn insert_batch<'job, I>(&self, jobs: I) -> Result<(), Error>
+    pub async fn insert_batch<I, Job>(&self, jobs: I) -> Result<(), Error>
     where
-        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I: IntoIterator<Item = Job> + Send,
         I::IntoIter: Send,
-        T: 'static,
+        Job: AsRef<InsertJob<T>> + Send,
     {
-        let client = self.pool.get().await?;
-
+        let client = self.client.client().await;
         let sink = client.copy_in(queries::InsertJobMany::QUERY).await?;
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);
         self.insert_jobs_copy_in(jobs, writer).await?;
 
-        self.notify(&client).await?;
+        self.notify(&*client).await?;
         Ok(())
     }
 
-    pub async fn insert_batch_tx<'job, I, C>(
+    pub async fn insert_batch_tx<I, Job>(
         &self,
         jobs: I,
-        tx: &deadpool_postgres::Transaction<'_>,
+        tx: &tokio_postgres::Transaction<'_>,
     ) -> Result<(), Error>
     where
-        I: IntoIterator<Item = &'job InsertJob<T>> + Send,
+        I: IntoIterator<Item = Job> + Send,
         I::IntoIter: Send,
-        C: deadpool_postgres::GenericClient,
-        T: 'job,
+        Job: AsRef<InsertJob<T>> + Send,
     {
         let sink = tx.copy_in(queries::InsertJobMany::QUERY).await?;
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);

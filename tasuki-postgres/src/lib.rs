@@ -7,6 +7,45 @@ use bytes::{Buf, BufMut, BytesMut};
 const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
 const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";
 
+pub struct InsertJob<T> {
+    data: T,
+    max_attempts: u16,
+    delay: std::time::Duration,
+}
+
+impl<T> InsertJob<T> {
+    const DEFAULT_MAX_ATTEMPTS: u16 = 25;
+
+    pub const fn new(data: T) -> Self {
+        Self {
+            data,
+            max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
+            delay: std::time::Duration::from_secs(0),
+        }
+    }
+
+    pub fn max_attempts(self, max_attempts: u16) -> Self {
+        Self {
+            max_attempts,
+            ..self
+        }
+    }
+
+    pub fn delay(self, delay: std::time::Duration) -> Self {
+        Self { delay, ..self }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.data
+    }
+}
+
+impl<T> From<T> for InsertJob<T> {
+    fn from(value: T) -> Self {
+        InsertJob::new(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PgInterval {
     /// Number of microseconds
