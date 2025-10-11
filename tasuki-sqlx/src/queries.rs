@@ -117,7 +117,7 @@ WHERE
       (scheduled_at <= NOW() AND attempts < max_attempts AND queue_name = $2::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
-    LIMIT $3
+    LIMIT $3::INT4
   )
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token";
     pub fn query_as(

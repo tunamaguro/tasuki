@@ -116,6 +116,22 @@ where
     C: ClientAccess,
     T: serde::Serialize,
 {
+    pub fn new(client: C) -> Self {
+        Self {
+            client,
+            queue_name: std::borrow::Cow::Borrowed(crate::DEFAULT_QUEUE_NAME),
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn queue_name<S>(mut self, queue_name: S) -> Self
+    where
+        S: Into<std::borrow::Cow<'static, str>>,
+    {
+        self.queue_name = queue_name.into();
+        self
+    }
+
     async fn notify<U>(&self, client: &U) -> Result<(), Error>
     where
         U: tokio_postgres::GenericClient,
