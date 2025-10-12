@@ -6,6 +6,7 @@ mod pg_type;
 mod queries;
 
 const DEFAULT_QUEUE_NAME: &str = "tasuki_default";
+#[allow(unused)]
 const NOTIFY_CHANNEL_NAME: &str = "tasuki_jobs";
 
 pub trait ClientAccess: Clone + Send + Sync + 'static {
@@ -36,9 +37,9 @@ impl ClientAccess for std::sync::Arc<::tokio_postgres::Client> {
     }
 }
 
-impl ClientAccess for std::sync::Arc<tokio::sync::Mutex<::tokio_postgres::Client>> {
+impl ClientAccess for std::sync::Arc<futures::lock::Mutex<tokio_postgres::Client>> {
     type Handle<'a>
-        = tokio::sync::MutexGuard<'a, ::tokio_postgres::Client>
+        = futures::lock::MutexGuard<'a, tokio_postgres::Client>
     where
         Self: 'a;
     type Error = std::convert::Infallible;
@@ -51,31 +52,55 @@ impl ClientAccess for std::sync::Arc<tokio::sync::Mutex<::tokio_postgres::Client
         Box::pin(async move { Ok(self.lock().await) })
     }
 }
+#[cfg(feature = "rt-tokio")]
+mod tokio_impl {
+    use crate::ClientAccess;
+    impl ClientAccess for std::sync::Arc<tokio::sync::Mutex<tokio_postgres::Client>> {
+        type Handle<'a>
+            = tokio::sync::MutexGuard<'a, ::tokio_postgres::Client>
+        where
+            Self: 'a;
+        type Error = std::convert::Infallible;
+        type Fut<'a>
+            = futures::future::BoxFuture<'a, Result<Self::Handle<'a>, Self::Error>>
+        where
+            Self: 'a;
 
-pub struct DeadPoolObjectWrapper(pub deadpool_postgres::Object);
-
-impl std::ops::Deref for DeadPoolObjectWrapper {
-    type Target = ::tokio_postgres::Client;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        fn client<'a>(&'a self) -> Self::Fut<'a> {
+            Box::pin(async move { Ok(self.lock().await) })
+        }
     }
 }
 
-impl ClientAccess for deadpool_postgres::Pool {
-    type Handle<'a>
-        = DeadPoolObjectWrapper
-    where
-        Self: 'a;
-    type Error = deadpool_postgres::PoolError;
-    type Fut<'a>
-        = futures::future::BoxFuture<'a, Result<Self::Handle<'a>, Self::Error>>
-    where
-        Self: 'a;
-    fn client<'a>(&'a self) -> Self::Fut<'a> {
-        Box::pin(async move {
-            let obj = self.get().await?;
-            Ok(DeadPoolObjectWrapper(obj))
-        })
+#[cfg(feature = "deadpool-postgres")]
+mod deadpool_impl {
+    use crate::ClientAccess;
+
+    pub struct DeadPoolObjectWrapper(pub deadpool_postgres::Object);
+
+    impl std::ops::Deref for DeadPoolObjectWrapper {
+        type Target = ::tokio_postgres::Client;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ClientAccess for deadpool_postgres::Pool {
+        type Handle<'a>
+            = DeadPoolObjectWrapper
+        where
+            Self: 'a;
+        type Error = deadpool_postgres::PoolError;
+        type Fut<'a>
+            = futures::future::BoxFuture<'a, Result<Self::Handle<'a>, Self::Error>>
+        where
+            Self: 'a;
+        fn client<'a>(&'a self) -> Self::Fut<'a> {
+            Box::pin(async move {
+                let obj = self.get().await?;
+                Ok(DeadPoolObjectWrapper(obj))
+            })
+        }
     }
 }
