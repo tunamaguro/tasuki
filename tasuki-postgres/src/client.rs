@@ -132,19 +132,6 @@ where
         self
     }
 
-    async fn notify<U>(&self, client: &U) -> Result<(), Error>
-    where
-        U: tokio_postgres::GenericClient,
-    {
-        queries::AddJobNotify::builder()
-            .queue_name(&self.queue_name)
-            .channel_name(crate::NOTIFY_CHANNEL_NAME)
-            .build()
-            .execute(client)
-            .await?;
-        Ok(())
-    }
-
     pub async fn insert(&self, job: &InsertJob<T>) -> Result<(), Error> {
         let client = self.client.get_handle().await?;
         self.insert_tx(job, &*client).await
@@ -171,8 +158,6 @@ where
             .build()
             .execute(client)
             .await?;
-
-        self.notify(client).await?;
 
         Ok(())
     }
@@ -225,7 +210,6 @@ where
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);
         self.insert_jobs_copy_in(jobs, writer).await?;
 
-        self.notify(&*client).await?;
         Ok(())
     }
 
@@ -243,7 +227,6 @@ where
         let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, Self::QUERY_TYPES);
         self.insert_jobs_copy_in(jobs, writer).await?;
 
-        self.notify(tx).await?;
         Ok(())
     }
 }
