@@ -15,7 +15,7 @@ where
 {
     /// create a new connection
     ///
-    /// `PgListener` try reconnect until return `None`
+    /// `PgListenPool` try reconnect until return `None`
     fn make_connection(
         &self,
     ) -> impl std::future::Future<
@@ -124,13 +124,13 @@ impl<S, T> Deref for PgListenConnection<S, T> {
     }
 }
 
-struct PgListener<F, S, T> {
+struct PgListenPool<F, S, T> {
     conn: Option<PgListenConnection<S, T>>,
     make_connection: F,
     channels: Vec<std::borrow::Cow<'static, str>>,
 }
 
-impl<F, S, T> PgListener<F, S, T>
+impl<F, S, T> PgListenPool<F, S, T>
 where
     F: MakeConnection<S, T>,
     S: AsyncRead + AsyncWrite + Unpin,
@@ -147,8 +147,8 @@ where
     fn from_connection(
         client: tokio_postgres::Client,
         connection: Connection<S, T>,
-    ) -> PgListener<NoopMakeConnection, S, T> {
-        PgListener {
+    ) -> PgListenPool<NoopMakeConnection, S, T> {
+        PgListenPool {
             conn: Some(PgListenConnection::new(client, connection)),
             make_connection: NoopMakeConnection,
             channels: Default::default(),
