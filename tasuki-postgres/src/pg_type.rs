@@ -105,7 +105,7 @@ impl<'q> postgres_types::FromSql<'q> for PgVoid {
         if !Self::accepts(ty) {
             return Err(format!("expected VOID, got {ty}").into());
         }
-        if raw.len() != 0 {
+        if !raw.is_empty() {
             return Err("Invalid buffer size".into());
         }
 
