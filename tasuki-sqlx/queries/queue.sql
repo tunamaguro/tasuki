@@ -22,7 +22,7 @@ WHERE
       (scheduled_at <= NOW() AND attempts < max_attempts AND queue_name = sqlc.arg(queue_name)::TEXT)
     ORDER BY scheduled_at ASC
     FOR UPDATE SKIP LOCKED
-    LIMIT sqlc.arg(batch_size)
+    LIMIT sqlc.arg(batch_size)::INT4
   )
 RETURNING j.id, j.job_data, j.lease_token::UUID AS lease_token;
 

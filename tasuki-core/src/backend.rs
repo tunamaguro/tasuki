@@ -6,12 +6,7 @@ mod tmp {
 
     /// Heartbeat result
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    pub enum Heartbeat {
-        /// continue job
-        Continue,
-        /// stop job. No finalization
-        Stop,
-    }
+    pub struct HeartbeatStop;
 
     /// Per-job context for heartbeats and finalization.
     #[trait_variant::make(BackEndContext: Send)]
@@ -19,7 +14,7 @@ mod tmp {
         type Driver: BackEndDriver;
 
         #[allow(unused)]
-        async fn heartbeat(&mut self) -> Heartbeat;
+        async fn heartbeat(&mut self) -> HeartbeatStop;
         #[allow(unused)]
         async fn complete(self) -> Result<(), <Self::Driver as BackEndDriver>::Error>;
         #[allow(unused)]
@@ -63,4 +58,4 @@ mod tmp {
     }
 }
 
-pub use tmp::{BackEndContext, BackEndDriver, BackEndPoller, Heartbeat, Job};
+pub use tmp::{BackEndContext, BackEndDriver, BackEndPoller, HeartbeatStop, Job};

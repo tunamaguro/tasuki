@@ -4,7 +4,7 @@ use pin_project_lite::pin_project;
 use serde::{Deserialize, de::DeserializeOwned};
 use tasuki_core::{
     BackEndContext, BackEndDriver, BackEndPoller, Job, JobHandler, Worker,
-    backend::Heartbeat,
+    backend::HeartbeatStop,
     utils::{Throttle, ThrottleExt, Ticker},
     worker::{JobSpawner, TickStream},
 };
@@ -110,7 +110,7 @@ pub struct OutTxContext {
 impl BackEndContext for OutTxContext {
     type Driver = PostgresDriver;
 
-    async fn heartbeat(&mut self) -> Heartbeat {
+    async fn heartbeat(&mut self) -> HeartbeatStop {
         let interval = self.interval / 3;
         let mut retry_count = 0;
 
@@ -133,17 +133,17 @@ impl BackEndContext for OutTxContext {
                         }
                         queries::TasukiJobStatus::Canceled => {
                             tracing::info!(job_id = %self.id, "job canceled");
-                            return Heartbeat::Stop;
+                            return HeartbeatStop;
                         }
                         other => {
                             tracing::error!(job_id = %self.id, status = status_to_str(other), "unexpected status. expected 'running'");
-                            return Heartbeat::Stop;
+                            return HeartbeatStop;
                         }
                     }
                 }
                 Ok(None) => {
                     tracing::error!(job_id = %self.id, lease_token = %self.lease_token, "lost job lease");
-                    return Heartbeat::Stop;
+                    return HeartbeatStop;
                 }
                 Err(error) => {
                     retry_count += 1;

@@ -13,7 +13,7 @@ struct PgDateTime(pub std::time::SystemTime);
 
 impl sqlx::Type<sqlx::Postgres> for PgDateTime {
     fn type_info() -> <sqlx::Postgres as sqlx::Database>::TypeInfo {
-        // COPY FROM https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat#L306-L311
+        // COPY FROM https://github.com/postgres/postgres/blob/REL_18_0/src/include/catalog/pg_type.dat#L306-L312
         use sqlx::postgres;
         postgres::PgTypeInfo::with_name("timestamptz")
     }
@@ -51,7 +51,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PgDateTime {
         let pg_us = <i64 as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
 
         // i64::MIN and i64::MAX reserved for +-infinity but not supported
-        // See https://github.com/postgres/postgres/blob/master/src/include/datatype/timestamp.h#L146-L151
+        // See https://github.com/postgres/postgres/blob/REL_18_0/src/include/datatype/timestamp.h#L146-L151
         if pg_us == i64::MIN || pg_us == i64::MAX {
             return Err("timestamptz is ±infinity; PgDateTime cannot represent infinity".into());
         }

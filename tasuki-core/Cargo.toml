@@ -13,8 +13,8 @@ rt-tokio = ["tokio"]
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
 tracing = { workspace = true }
+futures-timer = { workspace = true }
 
-futures-timer = "3.0"
 trait-variant = "0.1.2"
 
 tokio = { version = "1.0", default-features = false, features = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tasuki-core", "tasuki-sqlx"]
+members = ["tasuki-core", "tasuki-postgres", "tasuki-sqlx"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,11 @@ license = "Apache-2.0 OR MIT"
 futures = "0.3"
 pin-project-lite = "0.2"
 tracing = "0.1"
+futures-timer = "3.0"
 
 tasuki-core = { path = "./tasuki-core" }
 tasuki-sqlx = { path = "./tasuki-sqlx" }
+
+# for example only
+tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
