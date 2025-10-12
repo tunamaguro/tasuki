@@ -1576,6 +1576,7 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "futures-timer",
+ "pin-project-lite",
  "postgres-types",
  "serde",
  "serde_json",
